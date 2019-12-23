@@ -21,6 +21,7 @@ from __future__ import print_function
 
 import tensorflow as tf
 import numpy as np
+import warnings
 
 from distutils.version import LooseVersion
 if LooseVersion(tf.__version__) >= LooseVersion("1.4.0"):
@@ -40,11 +41,15 @@ class TfKerasTests(tf.test.TestCase):
 
     def __init__(self, *args, **kwargs):
         super(TfKerasTests, self).__init__(*args, **kwargs)
-
-    def test_train_model(self):
+        warnings.simplefilter('module')
         hvd.init()
 
-        with self.test_session() as sess:
+        self.config = tf.ConfigProto()
+        self.config.gpu_options.allow_growth = True
+        self.config.gpu_options.visible_device_list = str(hvd.local_rank())
+
+    def test_train_model(self):
+        with self.test_session(config=self.config) as sess:
             K.set_session(sess)
 
             opt = keras.optimizers.RMSprop(lr=0.0001)
@@ -77,9 +82,7 @@ class TfKerasTests(tf.test.TestCase):
                                 initial_epoch=1)
 
     def test_sparse_as_dense(self):
-        hvd.init()
-
-        with self.test_session() as sess:
+        with self.test_session(config=self.config) as sess:
             K.set_session(sess)
 
             opt = keras.optimizers.RMSprop(lr=0.0001)
@@ -94,3 +97,17 @@ class TfKerasTests(tf.test.TestCase):
             y = np.random.random((32, 10, 64))
             # No assertions, we just need to verify that it doesn't hang
             model.train_on_batch(x, y)
+
+    def test_from_config(self):
+        with self.test_session(config=self.config) as sess:
+            K.set_session(sess)
+
+            opt = keras.optimizers.Adam()
+            hopt = hvd.DistributedOptimizer(opt)
+            cfg = hopt.get_config()
+
+            hopt_copy1 = hopt.from_config(cfg)
+            self.assertEqual(cfg, hopt_copy1.get_config())
+
+            hopt_copy2 = hopt.__class__.from_config(cfg)
+            self.assertEqual(cfg, hopt_copy2.get_config())

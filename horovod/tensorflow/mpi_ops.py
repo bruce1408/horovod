@@ -1,5 +1,6 @@
 # Copyright 2016 The TensorFlow Authors. All Rights Reserved.
-# Modifications copyright (C) 2017 Uber Technologies, Inc.
+# Modifications copyright (C) 2019 Uber Technologies, Inc.
+# Modifications copyright Microsoft
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,38 +26,27 @@ from tensorflow.python.framework import load_library
 from tensorflow.python.framework import ops
 from tensorflow.python.platform import resource_loader
 
-from horovod.common import get_ext_suffix
-from horovod.common import HorovodBasics as _HorovodBasics
+from horovod.common.util import get_ext_suffix, get_average_backwards_compatibility_fun, gpu_available, \
+    num_rank_is_power_2
+from horovod.common.basics import HorovodBasics as _HorovodBasics
 from horovod.tensorflow.util import _executing_eagerly
 
 
-def _load_library(name, op_list=None):
+def _load_library(name):
     """Loads a .so file containing the specified operators.
 
     Args:
       name: The name of the .so file to load.
-      op_list: A list of names of operators that the library should have. If None
-          then the .so file's contents will not be verified.
 
     Raises:
-      NameError if one of the required ops is missing.
       NotFoundError if were not able to load .so file.
     """
     filename = resource_loader.get_path_to_datafile(name)
     library = load_library.load_op_library(filename)
-    for expected_op in (op_list or []):
-        for lib_op in library.OP_LIST.op:
-            if lib_op.name == expected_op:
-                break
-        else:
-            raise NameError(
-                'Could not find operator %s in dynamic library %s' %
-                (expected_op, name))
     return library
 
 
-MPI_LIB = _load_library('mpi_lib' + get_ext_suffix(),
-                        ['HorovodAllgather', 'HorovodAllreduce'])
+MPI_LIB = _load_library('mpi_lib' + get_ext_suffix())
 
 _basics = _HorovodBasics(__file__, 'mpi_lib')
 
@@ -68,6 +58,31 @@ local_size = _basics.local_size
 rank = _basics.rank
 local_rank = _basics.local_rank
 mpi_threads_supported = _basics.mpi_threads_supported
+mpi_enabled = _basics.mpi_enabled
+mpi_built = _basics.mpi_built
+gloo_enabled = _basics.gloo_enabled
+gloo_built = _basics.gloo_built
+nccl_built = _basics.nccl_built
+ddl_built = _basics.ddl_built
+ccl_built = _basics.ccl_built
+
+# import reduction op values
+Average = _basics.Average
+Sum = _basics.Sum
+Adasum = _basics.Adasum
+
+is_homogeneous = _basics.is_homogeneous
+
+handle_average_backwards_compatibility = get_average_backwards_compatibility_fun(_basics)
+
+check_num_rank_power_of_2 = num_rank_is_power_2
+
+
+# This function will create a default device map which includes all visible devices.
+# Please run this function in a subprocess
+def _check_has_gpu():
+    import tensorflow as tf
+    return tf.test.is_gpu_available()
 
 
 def _normalize_name(name):
@@ -75,8 +90,9 @@ def _normalize_name(name):
     return re.sub('[^a-zA-Z0-9_]', '_', name)
 
 
-def _allreduce(tensor, name=None):
-    """An op which sums an input tensor over all the Horovod processes.
+def _allreduce(tensor, name=None, op=Sum):
+    """An op which reduces an input tensor over all the Horovod processes. The
+    default reduction is a sum.
 
     The reduction operation is keyed by the name of the op. The tensor type and
     shape must be the same on all Horovod processes for a given name. The reduction
@@ -88,7 +104,7 @@ def _allreduce(tensor, name=None):
     """
     if name is None and not _executing_eagerly():
         name = 'HorovodAllreduce_%s' % _normalize_name(tensor.name)
-    return MPI_LIB.horovod_allreduce(tensor, name=name)
+    return MPI_LIB.horovod_allreduce(tensor, name=name, reduce_op=op)
 
 
 @ops.RegisterGradient('HorovodAllreduce')
@@ -137,12 +153,14 @@ def _allgather_grad(op, grad):
     """
     grad = _allreduce(grad)
 
-    x = op.inputs[0]
-    d0 = x.get_shape().as_list()[0]
-    d = tf.convert_to_tensor([d0], dtype=tf.int32)
+    with tf.device('/cpu:0'):
+        # Keep the tensor of split sizes on CPU.
+        x = op.inputs[0]
+        d0 = x.get_shape().as_list()[0]
+        d = tf.convert_to_tensor([d0], dtype=tf.int32)
 
-    s = size()
-    d = tf.reshape(allgather(d), [s])
+        s = size()
+        d = tf.reshape(allgather(d), [s])
 
     splits = tf.split(grad, num_or_size_splits=d, axis=0)
     return splits[rank()]

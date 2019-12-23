@@ -1,4 +1,5 @@
 // Copyright 2018 Uber Technologies, Inc. All Rights Reserved.
+// Modifications copyright Microsoft
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -49,8 +50,8 @@ int GetDeviceID(const ::torch::Tensor& tensor) {
 
 } // namespace
 
-int DoAllreduce(::torch::Tensor tensor, ::torch::Tensor output, int average,
-                const std::string& name) {
+int DoAllreduce(::torch::Tensor tensor, ::torch::Tensor output, int divisor,
+                const std::string& name, int reduce_op_int) {
   ThrowIfError(common::CheckInitialized());
 
   auto handle = handle_manager.AllocateHandle();
@@ -60,23 +61,25 @@ int DoAllreduce(::torch::Tensor tensor, ::torch::Tensor output, int average,
   auto hvd_context = std::make_shared<TorchOpContext>(device, output);
   auto hvd_output = std::make_shared<TorchTensor>(output);
 
+  ReduceOp reduce_op = static_cast<ReduceOp>(reduce_op_int);
+  
   auto enqueue_result = EnqueueTensorAllreduce(
       hvd_context, hvd_tensor, hvd_output, ready_event,
       GetOpName("allreduce", name, handle), device,
-      [handle, average, output](const Status& status) mutable {
+      [handle, divisor, output](const Status& status) mutable {
         // Will execute in the `device` context.
-        if (average) {
-          output.div_(horovod_size());
+        if (divisor > 1) {
+          output.div_(divisor);
         }
         handle_manager.MarkDone(handle, status);
-      });
+      }, reduce_op);
   ThrowIfError(enqueue_result);
 
   return handle;
 }
 
-int DoAllreduceCudaOnCPU(::torch::Tensor tensor, ::torch::Tensor output, int average,
-                         const std::string& name) {
+int DoAllreduceCudaOnCPU(::torch::Tensor tensor, ::torch::Tensor output, int divisor,
+                         const std::string& name, int reduce_op_int) {
   ThrowIfError(common::CheckInitialized());
 
   // Make async copy of input tensor to CPU tensor and record completion event.
@@ -89,21 +92,22 @@ int DoAllreduceCudaOnCPU(::torch::Tensor tensor, ::torch::Tensor output, int ave
   auto hvd_context =
       std::make_shared<TorchOpContext>(CPU_DEVICE_ID, cpu_buffer);
 
+  ReduceOp reduce_op = static_cast<ReduceOp>(reduce_op_int);
   auto handle = handle_manager.AllocateHandle();
   auto enqueue_result = EnqueueTensorAllreduce(
       hvd_context, hvd_cpu_buffer, hvd_cpu_buffer, ready_event,
       GetOpName("allreduce", name, handle), CPU_DEVICE_ID,
-      [handle, average, cpu_buffer, output,
+      [handle, divisor, cpu_buffer, output,
        device](const Status& status) mutable {
         // Since the operation was on CPU, need to perform copy with the GPU
         // device guard.
         with_device device_guard(device);
         output.copy_(cpu_buffer);
-        if (average) {
-          output.div_(horovod_size());
+        if (divisor > 1) {
+          output.div_(divisor);
         }
         handle_manager.MarkDone(handle, status);
-      });
+      }, reduce_op);
   ThrowIfError(enqueue_result);
 
   return handle;
@@ -233,6 +237,31 @@ void WaitAndClear(int handle) {
   ThrowIfError(*status);
 }
 
+int DoJoin(int device) {
+  ThrowIfError(common::CheckInitialized());
+
+#if !HOROVOD_GPU_ALLREDUCE
+  device = CPU_DEVICE_ID;
+#endif
+
+  auto handle = handle_manager.AllocateHandle();
+  auto ready_event = RecordReadyEvent(device);
+  auto output = ::torch::empty(1);
+  auto hvd_context = std::make_shared<TorchOpContext>(device, output);
+
+  auto enqueue_result = EnqueueJoin(
+      hvd_context, ready_event,
+      JOIN_TENSOR_NAME, device,
+      [handle](const Status& status) mutable {
+        handle_manager.MarkDone(handle, status);
+      });
+  ThrowIfError(enqueue_result);
+
+  WaitAndClear(handle);
+  return handle;
+}
+
+
 PYBIND11_MODULE(mpi_lib_v2, m) {
   // allreduce
   m.def("horovod_torch_allreduce_async_torch_IntTensor", &DoAllreduce);
@@ -332,6 +361,9 @@ PYBIND11_MODULE(mpi_lib_v2, m) {
   m.def("horovod_torch_broadcast_async_torch_cuda_DoubleTensor",
         &DoBroadcastCudaOnCPU);
 #endif
+
+  // join
+  m.def("horovod_torch_join", &DoJoin);
 
   // basics
   m.def("horovod_torch_poll", &PollHandle);

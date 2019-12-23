@@ -1,5 +1,6 @@
 // Copyright 2016 The TensorFlow Authors. All Rights Reserved.
 // Modifications copyright (C) 2018 Uber Technologies, Inc.
+// Modifications copyright Microsoft
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -98,7 +99,7 @@ private:
 class TFTensor : public common::Tensor {
 public:
   TFTensor(::tensorflow::Tensor& tensor);
-  virtual const common::MPIDataType dtype() const override;
+  virtual const common::DataType dtype() const override;
   virtual const common::TensorShape shape() const override;
   virtual const void* data() const override;
   virtual int64_t size() const override;
@@ -115,6 +116,9 @@ public:
   virtual common::Status
   AllocateOutput(common::TensorShape shape,
                  std::shared_ptr<common::Tensor>* tensor) override;
+  virtual common::Status
+  AllocateZeros(int64_t num_elements, common::DataType dtype,
+                std::shared_ptr<common::Tensor>* tensor) override;
   virtual common::Framework framework() const override;
   OpKernelContext* GetKernelContext() const;
 
@@ -170,7 +174,7 @@ const void* TFPersistentBuffer::AccessData(
 
 TFTensor::TFTensor(::tensorflow::Tensor& tensor) : tensor_(tensor) {}
 
-const common::MPIDataType TFTensor::dtype() const {
+const common::DataType TFTensor::dtype() const {
   switch (tensor_.dtype()) {
   case DT_UINT8:
     return common::HOROVOD_UINT8;
@@ -225,7 +229,7 @@ common::Status
 TFOpContext::AllocateOutput(common::TensorShape shape,
                             std::shared_ptr<common::Tensor>* tensor) {
   TensorShape tf_shape;
-  for (int idx = 0; idx < shape.dims(); idx++) {
+  for (int idx = 0; idx < shape.dims(); ++idx) {
     tf_shape.AddDim(shape.dim_size(idx));
   }
   Tensor* tf_tensor;
@@ -242,6 +246,13 @@ TFOpContext::AllocateOutput(common::TensorShape shape,
   }
 #endif
   return ConvertStatus(status);
+}
+
+common::Status
+TFOpContext::AllocateZeros(int64_t num_elements, common::DataType dtype,
+                           std::shared_ptr<common::Tensor>* tensor) {
+  return common::Status::PreconditionError(
+      "AllocateZeros is not supported for TensorFlow yet.");
 }
 
 common::Framework TFOpContext::framework() const {
@@ -276,7 +287,9 @@ common::ReadyEvent* RecordReadyEvent(OpKernelContext* context) {
 class HorovodAllreduceOp : public AsyncOpKernel {
 public:
   explicit HorovodAllreduceOp(OpKernelConstruction* context)
-      : AsyncOpKernel(context) {}
+      : AsyncOpKernel(context) {
+    OP_REQUIRES_OK(context, context->GetAttr("reduce_op", &reduce_op_));
+  }
 
   void ComputeAsync(OpKernelContext* context, DoneCallback done) override {
     OP_REQUIRES_OK_ASYNC(context, ConvertStatus(common::CheckInitialized()),
@@ -285,6 +298,7 @@ public:
     auto node_name = name();
     auto device = GetDeviceID(context);
     auto tensor = context->input(0);
+    horovod::common::ReduceOp reduce_op = static_cast<horovod::common::ReduceOp>(reduce_op_);
     Tensor* output;
     OP_REQUIRES_OK_ASYNC(
         context, context->allocate_output(0, tensor.shape(), &output), done);
@@ -298,9 +312,12 @@ public:
         [context, done](const common::Status& status) {
           context->SetStatus(ConvertStatus(status));
           done();
-        });
+        }, reduce_op);
     OP_REQUIRES_OK_ASYNC(context, ConvertStatus(enqueue_result), done);
   }
+
+private:
+  int reduce_op_;
 };
 
 REGISTER_KERNEL_BUILDER(Name("HorovodAllreduce").Device(DEVICE_CPU),
@@ -312,6 +329,7 @@ REGISTER_KERNEL_BUILDER(Name("HorovodAllreduce").Device(DEVICE_GPU),
 
 REGISTER_OP("HorovodAllreduce")
     .Attr("T: {int32, int64, float16, float32, float64}")
+    .Attr("reduce_op: int")
     .Input("tensor: T")
     .Output("sum: T")
     .SetShapeFn([](shape_inference::InferenceContext* c) {
@@ -361,7 +379,7 @@ public:
 
 REGISTER_KERNEL_BUILDER(Name("HorovodAllgather").Device(DEVICE_CPU),
                         HorovodAllgatherOp);
-#if HAVE_CUDA
+#if HOROVOD_GPU_ALLGATHER
 REGISTER_KERNEL_BUILDER(Name("HorovodAllgather").Device(DEVICE_GPU),
                         HorovodAllgatherOp);
 #endif

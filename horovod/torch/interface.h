@@ -1,4 +1,5 @@
 // Copyright 2018 Uber Technologies, Inc. All Rights Reserved.
+// Modifications copyright Microsoft
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,16 +16,20 @@
 
 int horovod_torch_allreduce_async_torch_IntTensor(THIntTensor* tensor,
                                                   THIntTensor* output,
-                                                  int average, char* name);
+                                                  int divisor, char* name,
+                                                  int reduce_op);
 int horovod_torch_allreduce_async_torch_LongTensor(THLongTensor* tensor,
                                                    THLongTensor* output,
-                                                   int average, char* name);
+                                                   int divisor, char* name,
+                                                   int reduce_op);
 int horovod_torch_allreduce_async_torch_FloatTensor(THFloatTensor* tensor,
                                                     THFloatTensor* output,
-                                                    int average, char* name);
+                                                    int divisor, char* name,
+                                                    int reduce_op);
 int horovod_torch_allreduce_async_torch_DoubleTensor(THDoubleTensor* tensor,
                                                      THDoubleTensor* output,
-                                                     int average, char* name);
+                                                     int divisor, char* name,
+                                                     int reduce_op);
 
 int horovod_torch_allgather_async_torch_ByteTensor(THByteTensor* tensor,
                                                    THByteTensor* output,
@@ -72,3 +77,5 @@ int horovod_torch_broadcast_async_torch_DoubleTensor(THDoubleTensor* tensor,
 
 int horovod_torch_poll(int handle);
 void horovod_torch_wait_and_clear(int handle);
+
+void horovod_torch_join(int device);

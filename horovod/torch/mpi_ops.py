@@ -1,4 +1,5 @@
-# Copyright 2018 Uber Technologies, Inc. All Rights Reserved.
+# Copyright 2019 Uber Technologies, Inc. All Rights Reserved.
+# Modifications copyright Microsoft
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,19 +23,23 @@ from distutils.version import LooseVersion
 # Load all the necessary PyTorch C types.
 import torch
 
+import warnings
+
 # PyTorch v2 API starts with 1.0.0 (including nightly builds)
 _v2_api = LooseVersion(torch.__version__) >= LooseVersion('1.0.0')
 if _v2_api:
     from horovod.torch import mpi_lib_v2 as mpi_lib
-    from horovod.common import HorovodBasics as _HorovodBasics
+    from horovod.common.basics import HorovodBasics as _HorovodBasics
     _NULL = ""
     _basics = _HorovodBasics(__file__, 'mpi_lib_v2')
 else:
     from horovod.torch import mpi_lib_impl
     from horovod.torch import mpi_lib
-    from horovod.common import HorovodBasics as _HorovodBasics
+    from horovod.common.basics import HorovodBasics as _HorovodBasics
     _NULL = mpi_lib._ffi.NULL
     _basics = _HorovodBasics(__file__, 'mpi_lib_impl', '_mpi_lib_impl')
+
+from horovod.common.util import get_average_backwards_compatibility_fun, gpu_available, num_rank_is_power_2
 
 from horovod.torch.compression import Compression
 
@@ -46,6 +51,22 @@ local_size = _basics.local_size
 rank = _basics.rank
 local_rank = _basics.local_rank
 mpi_threads_supported = _basics.mpi_threads_supported
+mpi_enabled = _basics.mpi_enabled
+mpi_built = _basics.mpi_built
+gloo_enabled = _basics.gloo_enabled
+gloo_built = _basics.gloo_built
+nccl_built = _basics.nccl_built
+ddl_built = _basics.ddl_built
+ccl_built = _basics.ccl_built
+
+# import reduction op values
+Average = _basics.Average
+Sum = _basics.Sum
+Adasum = _basics.Adasum
+
+is_homogeneous = _basics.is_homogeneous
+
+handle_average_backwards_compatibility = get_average_backwards_compatibility_fun(_basics)
 
 
 # Schema: handle -> input, output
@@ -70,20 +91,45 @@ def _allreduce_function_factory(tensor):
     return 'horovod_torch_allreduce_async_' + tensor.type().replace('.', '_')
 
 
-def _allreduce_async(tensor, output, average, name):
+def _allreduce_async(tensor, output, name, op):
     if tensor.dtype == torch.float16 and not _fp16_supported:
         raise NotImplementedError(
             'float16 allreduce is not supported for PyTorch version {} < 1.0.0'
             .format(torch.__version__))
 
+    # Set the divisor for reduced gradients to average when necessary
+    if op == Average:
+        divisor = size()
+    elif op == Adasum:
+        if tensor.device.type != 'cpu' and gpu_available('torch'):
+            if nccl_built():
+                if not is_homogeneous():
+                    raise NotImplementedError('Running GPU Adasum on heterogeneous cluster is not supported yet.')
+                elif not num_rank_is_power_2(int(size() / local_size())):
+                    raise NotImplementedError('Running GPU Adasum with non-power of 2 nodes is not supported yet.')
+                divisor = local_size()
+            else:
+                warnings.warn('Adasum reduction does not currently support GPU reduction using MPI. Tensors are '
+                              'copied to CPU memory instead. To use Adasum for GPU reduction, please compile Horovod '
+                              'with HOROVOD_GPU_ALLREDUCE=NCCL.')
+                divisor = 1
+        else:
+            if not num_rank_is_power_2(size()):
+                raise NotImplementedError('Running Adasum with non-power of 2 ranks is not supported yet.')
+            divisor = 1
+    else:
+        divisor = 1
+    # Averaging happens in framework code, so translate that to Sum for the actual call
+    true_op = Sum if op == Average else op
+
     function = _check_function(_allreduce_function_factory, tensor)
-    handle = getattr(mpi_lib, function)(tensor, output, average,
-                                        name.encode() if name is not None else _NULL)
+    handle = getattr(mpi_lib, function)(tensor, output, divisor,
+                                        name.encode() if name is not None else _NULL, true_op)
     _handle_map[handle] = (tensor, output)
     return handle
 
 
-def allreduce_async(tensor, average=True, name=None):
+def allreduce_async(tensor, average=None, name=None, op=None):
     """
     A function that performs asynchronous averaging or summation of the input tensor
     over all the Horovod processes. The input tensor is not modified.
@@ -94,34 +140,37 @@ def allreduce_async(tensor, average=True, name=None):
     are ready to send and receive the tensor.
 
     Arguments:
-        tensor: A tensor to average and sum.
-        average: A flag indicating whether to compute average or summation,
-                 defaults to average.
+        tensor: A tensor to reduce.
+        average: DEPRECATED, please use op instead.
         name: A name of the reduction operation.
+        op: The reduction operation to combine tensors across different 
+                   ranks. Defaults to Average if None is given.
 
     Returns:
         A handle to the allreduce operation that can be used with `poll()` or
         `synchronize()`.
     """
+    op = handle_average_backwards_compatibility(op, average)
     output = tensor.new(tensor.shape)
-    return _allreduce_async(tensor, output, average, name)
+    return _allreduce_async(tensor, output, name, op)
 
 
 class HorovodAllreduce(torch.autograd.Function):
     """An autograd function that performs allreduce on a tensor."""
 
     @staticmethod
-    def forward(ctx, tensor, average, name):
+    def forward(ctx, tensor, average, name, op):
         ctx.average = average
-        handle = allreduce_async(tensor, average, name)
+        ctx.op = op
+        handle = allreduce_async(tensor, average, name, op)
         return synchronize(handle)
 
     @staticmethod
     def backward(ctx, grad_output):
-        return allreduce(grad_output, ctx.average), None, None
+        return allreduce(grad_output, average=ctx.average, op=ctx.op), None, None, None
 
 
-def allreduce(tensor, average=True, name=None, compression=Compression.none):
+def allreduce(tensor, average=None, name=None, compression=Compression.none, op=None):
     """
     A function that performs averaging or summation of the input tensor over all the
     Horovod processes. The input tensor is not modified.
@@ -136,24 +185,25 @@ def allreduce(tensor, average=True, name=None, compression=Compression.none):
     to be computed and backpropagated.
 
     Arguments:
-        tensor: A tensor to average and sum.
-        average: A flag indicating whether to compute average or summation,
-                 defaults to average.
+        tensor: A tensor to reduce.
+        average: DEPRECATED, please use op instead.
         name: A name of the reduction operation.
         compression: Compression algorithm used during allreduce to reduce the amount
                      of data sent during the each parameter update step.  Defaults to
                      not using compression.
+        op: The reduction operation to combine tensors across different ranks. Defaults
+            to Average if None is given.
 
     Returns:
         A tensor of the same shape and type as `tensor`, averaged or summed across all
         processes.
     """
     tensor_compressed, ctx = compression.compress(tensor)
-    summed_tensor_compressed = HorovodAllreduce.apply(tensor_compressed, average, name)
+    summed_tensor_compressed = HorovodAllreduce.apply(tensor_compressed, average, name, op)
     return compression.decompress(summed_tensor_compressed, ctx)
 
 
-def allreduce_async_(tensor, average=True, name=None):
+def allreduce_async_(tensor, average=None, name=None, op=None):
     """
     A function that performs asynchronous in-place averaging or summation of the input
     tensor over all the Horovod processes.
@@ -164,19 +214,21 @@ def allreduce_async_(tensor, average=True, name=None):
     are ready to send and receive the tensor.
 
     Arguments:
-        tensor: A tensor to average and sum.
-        average: A flag indicating whether to compute average or summation,
-                 defaults to average.
+        tensor: A tensor to reduce.
+        average: DEPRECATED, please use op instead.
         name: A name of the reduction operation.
+        op: The reduction operation to combine tensors across different ranks. Defaults to
+            Average if None is given.
 
     Returns:
         A handle to the allreduce operation that can be used with `poll()` or
         `synchronize()`.
     """
-    return _allreduce_async(tensor, tensor, average, name)
+    op = handle_average_backwards_compatibility(op, average)
+    return _allreduce_async(tensor, tensor, name, op)
 
 
-def allreduce_(tensor, average=True, name=None):
+def allreduce_(tensor, average=None, name=None, op=None):
     """
     A function that performs in-place averaging or summation of the input tensor over
     all the Horovod processes.
@@ -187,16 +239,17 @@ def allreduce_(tensor, average=True, name=None):
     are ready to send and receive the tensor.
 
     Arguments:
-        tensor: A tensor to average and sum.
-        average: A flag indicating whether to compute average or summation,
-                 defaults to average.
+        tensor: A tensor to reduce.
+        average: DEPRECATED, please use op instead.
         name: A name of the reduction operation.
+        op: The reduction operation to combine tensors across different ranks. Defaults to
+            Average if None is given.
 
     Returns:
         A tensor of the same shape and type as `tensor`, averaged or summed across all
         processes.
     """
-    handle = allreduce_async_(tensor, average, name)
+    handle = allreduce_async_(tensor, average, name, op)
     return synchronize(handle)
 
 
@@ -436,3 +489,20 @@ def synchronize(handle):
     mpi_lib.horovod_torch_wait_and_clear(handle)
     _, output = _handle_map.pop(handle)
     return output
+
+
+def join(device=-1):
+    """A function that indicates that the rank finished processing data.
+
+    All ranks that did not call join() continue to process allreduce operations.
+    This function blocks Python thread until all ranks join.
+
+    Arguments:
+        device: An id of the device to create temprorary zero tensors (default -1, CPU)
+
+    Returns:
+        Id of the rank that joined last.
+    """
+    if not _v2_api:
+        raise NotImplementedError("Join Op is not supported for PyTorch < 1.0")
+    return mpi_lib.horovod_torch_join(device)

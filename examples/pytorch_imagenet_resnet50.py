@@ -30,6 +30,8 @@ parser.add_argument('--batches-per-allreduce', type=int, default=1,
                     help='number of batches processed locally before '
                          'executing allreduce across workers; it multiplies '
                          'total batch size.')
+parser.add_argument('--use-adasum', action='store_true', default=False,
+                    help='use adasum algorithm to do reduction')
 
 # Default settings from https://arxiv.org/abs/1706.02677.
 parser.add_argument('--batch-size', type=int, default=32,
@@ -86,6 +88,9 @@ verbose = 1 if hvd.rank() == 0 else 0
 log_writer = tensorboardX.SummaryWriter(args.log_dir) if hvd.rank() == 0 else None
 
 
+# Horovod: limit # of CPU threads to be used per worker.
+torch.set_num_threads(4)
+
 kwargs = {'num_workers': 4, 'pin_memory': True} if args.cuda else {}
 train_dataset = \
     datasets.ImageFolder(args.train_dir,
@@ -122,15 +127,21 @@ val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.val_batch_
 # Set up standard ResNet-50 model.
 model = models.resnet50()
 
+# By default, Adasum doesn't need scaling up learning rate.
+# For sum/average with gradient Accumulation: scale learning rate by batches_per_allreduce
+lr_scaler = args.batches_per_allreduce * hvd.size() if not args.use_adasum else 1
+
 if args.cuda:
     # Move model to GPU.
     model.cuda()
+    # If using GPU Adasum allreduce, scale learning rate by local_size.
+    if args.use_adasum and hvd.nccl_built():
+        lr_scaler = args.batches_per_allreduce * hvd.local_size()
 
 # Horovod: scale learning rate by the number of GPUs.
-# Gradient Accumulation: scale learning rate by batches_per_allreduce
 optimizer = optim.SGD(model.parameters(),
                       lr=(args.base_lr *
-                          args.batches_per_allreduce * hvd.size()),
+                          lr_scaler),
                       momentum=args.momentum, weight_decay=args.wd)
 
 # Horovod: (optional) compression algorithm.
@@ -140,7 +151,8 @@ compression = hvd.Compression.fp16 if args.fp16_allreduce else hvd.Compression.n
 optimizer = hvd.DistributedOptimizer(
     optimizer, named_parameters=model.named_parameters(),
     compression=compression,
-    backward_passes_per_step=args.batches_per_allreduce)
+    backward_passes_per_step=args.batches_per_allreduce,
+    op=hvd.Adasum if args.use_adasum else hvd.Average)
 
 # Restore from a previous checkpoint, if initial_epoch is specified.
 # Horovod: restore on the first worker which will broadcast weights to other workers.
@@ -176,7 +188,7 @@ def train(epoch):
                 output = model(data_batch)
                 train_accuracy.update(accuracy(output, target_batch))
                 loss = F.cross_entropy(output, target_batch)
-                train_loss.update(loss.item())
+                train_loss.update(loss)
                 # Average gradients among sub-batches
                 loss.div_(math.ceil(float(len(data)) / args.batch_size))
                 loss.backward()
