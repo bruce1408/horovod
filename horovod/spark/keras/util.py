@@ -13,15 +13,15 @@
 # limitations under the License.
 # ==============================================================================
 
-from __future__ import absolute_import
-
 import io
+
+from distutils.version import LooseVersion
 
 import h5py
 import numpy as np
 import tensorflow as tf
 
-from horovod.run.common.util import codec
+from horovod.runner.common.util import codec
 
 from horovod.spark.common import constants, params
 from horovod.spark.keras import optimizer, remote
@@ -49,22 +49,24 @@ class TFKerasUtil(object):
 
     @staticmethod
     def make_dataset_fn(feature_columns, label_columns, sample_weight_col, metadata,
-                        input_shapes, output_shapes, output_names, batch_size):
+                        input_shapes, label_shapes, output_names):
         # Check if any of the columns are only SparseVector
         has_sparse_col = any(metadata[col]['is_sparse_vector_only']
                              for col in label_columns + feature_columns)
 
         reshape = TFKerasUtil._reshape_fn(
             sample_weight_col, feature_columns, label_columns, metadata)
+
         prep_data_tf_keras = TFKerasUtil._prep_data_fn(
             has_sparse_col, sample_weight_col, feature_columns,
-            label_columns, input_shapes, output_shapes, output_names)
+            label_columns, input_shapes, label_shapes, output_names)
 
-        def fn(reader, shuffle_buffer_size, shuffle=False):
+        def fn(reader, batch_size, shuffle_buffer_size, is_batch_reader, shuffle=False):
             from petastorm.tf_utils import make_petastorm_dataset
 
-            dataset = make_petastorm_dataset(reader) \
-                .apply(tf.data.experimental.unbatch())
+            dataset = make_petastorm_dataset(reader)
+            if is_batch_reader:
+                dataset = dataset.apply(tf.data.experimental.unbatch())
 
             if shuffle:
                 dataset = dataset.shuffle(shuffle_buffer_size)
@@ -75,7 +77,7 @@ class TFKerasUtil(object):
 
             dataset = dataset.batch(batch_size).map(prep_data_tf_keras)
             return dataset
-        return fn
+        return tf.autograph.experimental.do_not_convert(fn)
 
     @staticmethod
     def get_horovod():
@@ -151,7 +153,7 @@ class TFKerasUtil(object):
 
     @staticmethod
     def _prep_data_fn(has_sparse_col, sample_weight_col, feature_columns, label_columns,
-                      input_shapes, output_shapes, output_names):
+                      input_shapes, label_shapes, output_names):
         def _get_from_dict(row, col):
             return row[col]
 
@@ -166,6 +168,9 @@ class TFKerasUtil(object):
         num_inputs = len(feature_columns)
         num_labels = len(label_columns)
 
+        def as_tuple(v):
+            return tuple(v) if len(v) > 1 else v[0]
+
         def prep(row):
             if sample_weight_col:
                 sample_weight = get_col_from_row_fn(row, sample_weight_col)
@@ -174,10 +179,10 @@ class TFKerasUtil(object):
                         tf.reshape(get_col_from_row_fn(row, feature_columns[i]), input_shapes[i])
                         for i
                         in range(num_inputs)),
-                    tuple(
-                        tf.reshape(get_col_from_row_fn(row, label_columns[j]), output_shapes[j]) for
+                    as_tuple([
+                        tf.reshape(get_col_from_row_fn(row, label_columns[j]), label_shapes[j]) for
                         j
-                        in range(num_labels)),
+                        in range(num_labels)]),
                     {name: tf.reshape(sample_weight, [-1]) for name in output_names}
                 )
             else:
@@ -186,10 +191,10 @@ class TFKerasUtil(object):
                         tf.reshape(get_col_from_row_fn(row, feature_columns[i]), input_shapes[i])
                         for i
                         in range(num_inputs)),
-                    tuple(
-                        tf.reshape(get_col_from_row_fn(row, label_columns[j]), output_shapes[j]) for
+                    as_tuple([
+                        tf.reshape(get_col_from_row_fn(row, label_columns[j]), label_shapes[j]) for
                         j
-                        in range(num_labels))
+                        in range(num_labels)])
                 )
 
         return prep
@@ -214,13 +219,13 @@ class BareKerasUtil(object):
 
     @staticmethod
     def make_dataset_fn(feature_columns, label_columns, sample_weight_col, metadata,
-                        input_shapes, output_shapes, output_names, batch_size):
+                        input_shapes, label_shapes, output_names, batch_size):
         batch_generator = BareKerasUtil._batch_generator_fn(
             feature_columns, label_columns, sample_weight_col,
-            input_shapes, output_shapes, batch_size, metadata)
+            input_shapes, label_shapes, batch_size, metadata)
 
         def fn(reader, shuffle_buffer_size, shuffle=False):
-            return batch_generator(reader, shuffle_buffer_size)
+            return batch_generator(reader, shuffle_buffer_size, shuffle)
 
         return fn
 
@@ -276,7 +281,7 @@ class BareKerasUtil(object):
 
     @staticmethod
     def _batch_generator_fn(feature_columns, label_columns, sample_weight_col,
-                            input_shapes, output_shapes, batch_size, metadata):
+                            input_shapes, label_shapes, batch_size, metadata):
         prepare_data_bare_keras = BareKerasUtil._prepare_data_fn(metadata)
 
         cols = feature_columns + label_columns
@@ -306,7 +311,7 @@ class BareKerasUtil(object):
                 inputs = [prepare_data_bare_keras(data[col][perm], col, shape) for col, shape
                           in zip(feature_columns, input_shapes)]
                 labels = [prepare_data_bare_keras(data[col][perm], col, shape) for col, shape
-                          in zip(label_columns, output_shapes)]
+                          in zip(label_columns, label_shapes)]
 
                 num_outputs = len(label_columns)
                 sample_weights = None

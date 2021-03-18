@@ -21,6 +21,7 @@
 #include <thread>
 
 #include "fusion_buffer_manager.h"
+#include "group_table.h"
 #include "parameter_manager.h"
 #include "response_cache.h"
 #include "tensor_queue.h"
@@ -57,7 +58,7 @@ struct HorovodGlobalState {
   bool timeline_enabled = false;
 
   // Flag indicating whether to mark cycles in the timeline.
-  bool mark_cycles_in_timeline = false;
+  std::atomic_bool mark_cycles_in_timeline{false};
 
   ParameterManager parameter_manager;
 
@@ -87,11 +88,14 @@ struct HorovodGlobalState {
   // Number of responses that can be cached
   uint32_t cache_capacity = 1024;
 
-  // Number of CUDA streams to use
+  // Number of GPU streams to use
   int num_nccl_streams = 1;
 
-  // Index of current CUDA stream to use
+  // Index of current GPU stream to use
   int current_nccl_stream = 0;
+
+  // Information on registered groups.
+  GroupTable group_table;
 
   // A LibType indicating what framework we are using to perform CPU operations.
   LibType cpu_operation;
@@ -109,6 +113,12 @@ struct HorovodGlobalState {
   // Chunk size for MPI send/recv in Adasum allreduce. Some versions of Intel MPI
   // benefit from a smaller chunk size.
   int64_t adasum_mpi_chunk_size = 1<<30;
+
+  // Enable use of batched d2d memcopy kernel on GPU
+  bool batch_d2d_memcopies = true;
+
+  // Flag indicating whether to prohibit groups from fusing
+  bool disable_group_fusion = false;
 
   ~HorovodGlobalState() {
     // Make sure that the destructor of the background thread is safe to

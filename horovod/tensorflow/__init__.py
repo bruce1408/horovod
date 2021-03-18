@@ -16,32 +16,45 @@
 # ==============================================================================
 # pylint: disable=g-short-docstring-punctuation
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
+import os
+import warnings
 
-from horovod.common.util import check_extension, gpu_available
+from horovod.common.util import check_extension, gpu_available, split_list
 
 check_extension('horovod.tensorflow', 'HOROVOD_WITH_TENSORFLOW', __file__, 'mpi_lib')
 
+from horovod.tensorflow import elastic
 from horovod.tensorflow.compression import Compression
-from horovod.tensorflow.mpi_ops import allgather, broadcast, _allreduce
+from horovod.tensorflow.functions import allgather_object, broadcast_object, broadcast_object_fn, broadcast_variables
+from horovod.tensorflow.mpi_ops import allgather, broadcast, _allreduce, _grouped_allreduce, alltoall
 from horovod.tensorflow.mpi_ops import init, shutdown
-from horovod.tensorflow.mpi_ops import size, local_size, rank, local_rank, is_homogeneous
+from horovod.tensorflow.mpi_ops import is_initialized, start_timeline, stop_timeline
+from horovod.tensorflow.mpi_ops import size, local_size, cross_size, rank, local_rank, cross_rank, is_homogeneous
+from horovod.tensorflow.mpi_ops import rank_op, local_rank_op, size_op, local_size_op
 from horovod.tensorflow.mpi_ops import mpi_threads_supported, mpi_enabled, mpi_built
 from horovod.tensorflow.mpi_ops import gloo_enabled, gloo_built
-from horovod.tensorflow.mpi_ops import nccl_built, ddl_built, ccl_built
+from horovod.tensorflow.mpi_ops import nccl_built, ddl_built, ccl_built, cuda_built, rocm_built
 from horovod.tensorflow.mpi_ops import Average, Sum, Adasum
 from horovod.tensorflow.mpi_ops import handle_average_backwards_compatibility, check_num_rank_power_of_2
-
-from horovod.tensorflow.util import _executing_eagerly, _make_subgraph, _cache
+from horovod.tensorflow.util import _executing_eagerly, _make_subgraph, _cache, vars_to_refs, refs_to_vars
+from horovod.tensorflow.mpi_ops import join
+from horovod.tensorflow.sync_batch_norm import SyncBatchNormalization
+from horovod.tensorflow.gradient_aggregation import LocalGradientAggregationHelper
 
 import tensorflow as tf
-import warnings
+
+# @DEKHTIARJonathan: Do not remove, this fixes issues:
+# - https://github.com/tensorflow/tensorflow/issues/38516
+# - https://github.com/tensorflow/tensorflow/issues/39894
+if tf.__version__.startswith('2.2.'):
+  from tensorflow.python.keras.mixed_precision.experimental import device_compatibility_check
+  device_compatibility_check.log_device_compatibility_check = lambda policy_name, skip_local: None
 
 
 def allreduce(tensor, average=None, device_dense='', device_sparse='',
-              compression=Compression.none, op=None):
+              compression=Compression.none, op=None,
+              prescale_factor=1.0, postscale_factor=1.0,
+              name=None):
     """Perform an allreduce on a tf.Tensor or tf.IndexedSlices.
 
     This function performs a bandwidth-optimal ring allreduce on the input
@@ -52,24 +65,29 @@ def allreduce(tensor, average=None, device_dense='', device_sparse='',
     Arguments:
         tensor: tf.Tensor, tf.Variable, or tf.IndexedSlices to reduce.
                 The shape of the input must be identical across all ranks.
-        average: DEPRECATED, please use op instead.
+        average:
+            .. warning:: .. deprecated:: 0.19.0
+
+                Use `op` instead. Will be removed in v0.21.0.
+
         device_dense: Device to be used for dense tensors. Uses GPU by default
-                      if Horovod was built with HOROVOD_GPU_ALLREDUCE.
+                      if Horovod was built with HOROVOD_GPU_OPERATIONS.
         device_sparse: Device to be used for sparse tensors. Uses GPU by default
-                       if Horovod was built with HOROVOD_GPU_ALLGATHER.
+                       if Horovod was built with HOROVOD_GPU_OPERATIONS.
         compression: Compression algorithm used to reduce the amount of data
                      sent and received by each worker node.  Defaults to not
                      using compression.
         op: The reduction operation to combine tensors across different ranks.
             Defaults to Average if None is given.
+        prescale_factor: Multiplicative factor to scale tensor before allreduce.
+        postscale_factor: Multiplicative factor to scale tensor after allreduce.
+        name: A name of the allreduce operation
 
     Returns:
         A tensor of the same shape and type as `tensor`, summed across all
         processes.
     """
     op = handle_average_backwards_compatibility(op, average)
-    # Averaging happens in framework code, so translate that to Sum for the actual call
-    true_op = Sum if op == Average else op
 
     if isinstance(tensor, tf.IndexedSlices):
         # TODO: Need to fix this to actuall call Adasum
@@ -78,7 +96,8 @@ def allreduce(tensor, average=None, device_dense='', device_sparse='',
                                       'workaround please pass sparse_as_dense=True to DistributedOptimizer')
         with tf.device(device_sparse):
             # For IndexedSlices, do two allgathers instead of an allreduce.
-            horovod_size = tf.cast(size(), tensor.values.dtype)
+            horovod_size = tf.cast(size_op() if int(os.environ.get("HOROVOD_ELASTIC", 0)) else size(),
+                                   dtype=tensor.values.dtype)
             values = allgather(tensor.values)
             indices = allgather(tensor.indices)
 
@@ -88,10 +107,20 @@ def allreduce(tensor, average=None, device_dense='', device_sparse='',
         return tf.IndexedSlices(new_values, indices,
                                 dense_shape=tensor.dense_shape)
     else:
+        average_in_framework = False
+        if rocm_built():
+            # For ROCm, perform averaging at framework level
+            average_in_framework = op == Average or op == Adasum
+            op = Sum if op == Average else op
+
         with tf.device(device_dense):
-            horovod_size = tf.cast(size(), dtype=tensor.dtype)
+            horovod_size = tf.cast(size_op() if int(os.environ.get("HOROVOD_ELASTIC", 0)) else size(),
+                                   dtype=tensor.dtype)
             tensor_compressed, ctx = compression.compress(tensor)
-            summed_tensor_compressed = _allreduce(tensor_compressed, op=true_op)
+            summed_tensor_compressed = _allreduce(tensor_compressed, op=op,
+                                                  prescale_factor=prescale_factor,
+                                                  postscale_factor=postscale_factor,
+                                                  name=name)
             summed_tensor = compression.decompress(summed_tensor_compressed, ctx)
             if op == Adasum:
                 if 'CPU' not in tensor.device and gpu_available('tensorflow'):
@@ -102,57 +131,131 @@ def allreduce(tensor, average=None, device_dense='', device_sparse='',
                         elif not check_num_rank_power_of_2(int(size() / local_size())):
                             raise NotImplementedError(
                                 'Running GPU Adasum with non-power of 2 nodes is not supported yet.')
-                        horovod_local_size = tf.cast(local_size(), dtype=tensor.dtype)
-                        new_tensor = summed_tensor / horovod_local_size
+                        if rocm_built():
+                            horovod_local_size = tf.cast(local_size_op() if int(os.environ.get("HOROVOD_ELASTIC", 0)) else local_size(),
+                                                         dtype=tensor.dtype)
+                            new_tensor = summed_tensor / horovod_local_size
+                        else:
+                            new_tensor = summed_tensor
                     else:
                         warnings.warn('Adasum reduction does not currently support GPU reduction using MPI. Tensors '
                                       'are copied to CPU memory instead. To use Adasum for GPU reduction, please '
-                                      'compile Horovod with HOROVOD_GPU_ALLREDUCE=NCCL.')
+                                      'compile Horovod with HOROVOD_GPU_OPERATIONS=NCCL.')
                         new_tensor = summed_tensor
                 else:
                     if not check_num_rank_power_of_2(size()):
                         raise NotImplementedError('Running Adasum with non-power of 2 ranks is not supported yet.')
                     new_tensor = summed_tensor
             else:
-                new_tensor = (summed_tensor / horovod_size) if op == Average else summed_tensor
+                if rocm_built():
+                    new_tensor = (summed_tensor / horovod_size) if average_in_framework else summed_tensor
+                else:
+                    new_tensor = summed_tensor
         return new_tensor
 
+def grouped_allreduce(tensors, average=None, device_dense='', device_sparse='',
+                      compression=Compression.none, op=None,
+                      prescale_factor=1.0, postscale_factor=1.0):
+    if not tensors:
+        return tensors
 
-@_cache
-def _make_broadcast_group_fn():
-    if _executing_eagerly():
-        # Eager mode will parallelize independent control flow
-        def broadcast_group(variables, root_rank):
-            for var in variables:
-                var.assign(broadcast(var, root_rank))
+    op = handle_average_backwards_compatibility(op, average)
 
-        return _make_subgraph(broadcast_group)
+    average_in_framework = False
+    if rocm_built():
+        # For ROCm, perform averaging at framework level
+        average_in_framework = op == Average or op == Adasum
+        op = Sum if op == Average else op
+
+    if any(isinstance(t, tf.IndexedSlices) for t in tensors):
+        # TODO: Need to fix this to actuall call Adasum
+        if op == Adasum:
+            raise NotImplementedError('The Adasum reduction does not currently support sparse tensors. As a '
+                                      'workaround please pass sparse_as_dense=True to DistributedOptimizer')
+        with tf.device(device_sparse):
+            new_values = []
+            for tensor in tensors:
+                # For IndexedSlices, do two allgathers instead of an allreduce.
+                horovod_size = tf.cast(size_op() if int(os.environ.get("HOROVOD_ELASTIC", 0)) else size(),
+                                       dtype=tensor.values.dtype)
+                values = allgather(tensor.values)
+                indices = allgather(tensor.indices)
+
+                # To make this operation into an average, divide allgathered values by
+                # the Horovod size.
+                new_values += (values / horovod_size) if op == Average else values
+        return [tf.IndexedSlices(x, indices,
+                                 dense_shape=t.dense_shape) for x,t in zip(new_values, tensors)]
     else:
-        # Graph mode requires an Op
-        def broadcast_group(variables, root_rank):
-            return tf.group(*[var.assign(broadcast(var, root_rank))
-                              for var in variables])
+        with tf.device(device_dense):
+            tensors_compressed, ctxs = zip(*[compression.compress(tensor) for tensor in tensors])
+            summed_tensors_compressed = _grouped_allreduce(tensors_compressed, op=op,
+                                                           prescale_factor=prescale_factor,
+                                                           postscale_factor=postscale_factor)
+            summed_tensors = [compression.decompress(t, ctx) for t, ctx in zip(summed_tensors_compressed, ctxs)]
+            if op == Adasum:
+                if 'CPU' not in tensor.device and gpu_available('tensorflow'):
+                    if nccl_built():
+                        if not is_homogeneous:
+                            raise NotImplementedError(
+                                'Running GPU Adasum on heterogeneous cluster is not supported yet.')
+                        elif not check_num_rank_power_of_2(int(size() / local_size())):
+                            raise NotImplementedError(
+                                'Running GPU Adasum with non-power of 2 nodes is not supported yet.')
+                        if rocm_built():
+                            new_tensors = []
+                            for tensor in summed_tensors:
+                              horovod_local_size = tf.cast(local_size_op() if int(os.environ.get("HOROVOD_ELASTIC", 0)) else local_size(),
+                                                           dtype=tensor.dtype)
+                              new_tensors += tensor / horovod_local_size
+                        else:
+                            new_tensors = summed_tensors
+                    else:
+                        warnings.warn('Adasum reduction does not currently support GPU reduction using MPI. Tensors '
+                                      'are copied to CPU memory instead. To use Adasum for GPU reduction, please '
+                                      'compile Horovod with HOROVOD_GPU_OPERATIONS=NCCL.')
+                        new_tensors = summed_tensors
+                else:
+                    if not check_num_rank_power_of_2(size()):
+                        raise NotImplementedError('Running Adasum with non-power of 2 ranks is not supported yet.')
+                    new_tensors = summed_tensors
+            else:
+                if rocm_built():
+                    new_tensors = []
+                    for tensor in summed_tensors:
+                        horovod_size = tf.cast(size_op() if int(os.environ.get("HOROVOD_ELASTIC", 0)) else size(),
+                                               dtype=tensor.dtype)
+                        new_tensors += (tensor / horovod_size) if average_in_framework else tensor
+                else:
+                    new_tensors = summed_tensors
+        return new_tensors
 
-        return broadcast_group
+def _allreduce_cond(tensor, *args, **kwargs):
+    def allreduce_fn():
+        return allreduce(tensor, *args, **kwargs)
 
+    def id_fn():
+        return tensor
 
-def broadcast_variables(variables, root_rank):
-    """Broadcasts variables from root rank to all other processes.
+    return tf.cond((size_op() > 1) if int(os.environ.get("HOROVOD_ELASTIC", 0)) else tf.convert_to_tensor(size() > 1),
+                   allreduce_fn, id_fn)
 
-    Arguments:
-        variables: variables for broadcast
-        root_rank: rank of the process from which global variables will be broadcasted
-                   to all other processes.
-    """
-    broadcast_group = _make_broadcast_group_fn()
-    return broadcast_group(variables, root_rank)
+def _grouped_allreduce_cond(tensors, *args, **kwargs):
+    def allreduce_fn():
+        return grouped_allreduce(tensors, *args, **kwargs)
+
+    def id_fn():
+        return tensors
+
+    return tf.cond((size_op() > 1) if int(os.environ.get("HOROVOD_ELASTIC", 0)) else tf.convert_to_tensor(size() > 1),
+                   allreduce_fn, id_fn)
 
 
 try:
-    _global_variables = tf.global_variables
+    _global_variables = tf.compat.v1.global_variables
 except AttributeError:
     try:
-        _global_variables = tf.compat.v1.global_variables
+        _global_variables = tf.global_variables
     except AttributeError:
         _global_variables = None
 
@@ -175,10 +278,10 @@ if _global_variables is not None:
         return broadcast_variables(_global_variables(), root_rank)
 
 try:
-    _get_default_graph = tf.get_default_graph
+    _get_default_graph = tf.compat.v1.get_default_graph
 except AttributeError:
     try:
-        _get_default_graph = tf.compat.v1.get_default_graph
+        _get_default_graph = tf.get_default_graph
     except AttributeError:
         _get_default_graph = None
 
@@ -211,7 +314,7 @@ if _SessionRunHook is not None and _get_default_graph is not None:
                 Rank that will send data, other ranks will receive data.
               device:
                 Device to be used for broadcasting. Uses GPU by default
-                if Horovod was built with HOROVOD_GPU_BROADCAST.
+                if Horovod was built with HOROVOD_GPU_OPERATIONS.
             """
             super(BroadcastGlobalVariablesHook, self).__init__()
             self.root_rank = root_rank
@@ -228,20 +331,69 @@ if _SessionRunHook is not None and _get_default_graph is not None:
 
 
 @_cache
-def _make_allreduce_grads_fn(name, device_dense, device_sparse,
-                             compression, sparse_as_dense, op):
-    def allreduce_grads(grads):
+def _make_cached_allreduce_grads_fn(name, device_dense, device_sparse,
+                                    compression, sparse_as_dense, op,
+                                    gradient_predivide_factor, groups):
+    groups = refs_to_vars(groups) if isinstance(groups, tuple) else groups
+    if op == Average:
+        # Split average operation across pre/postscale factors
+        # C++ backend will apply additional 1 / size() factor to postscale_factor for op == Average.
+        prescale_factor = 1.0 / gradient_predivide_factor
+        postscale_factor = gradient_predivide_factor
+    else:
+        prescale_factor = 1.0
+        postscale_factor = 1.0
+
+    def allreduce_grads(grads, vars=None):
         with tf.name_scope(name + "_Allreduce"):
             if sparse_as_dense:
                 grads = [tf.convert_to_tensor(grad)
                          if grad is not None and isinstance(grad, tf.IndexedSlices)
                          else grad for grad in grads]
 
-            return [allreduce(grad,
-                              device_dense=device_dense,
-                              device_sparse=device_sparse,
-                              compression=compression,
-                              op=op)
+            if groups is not None:
+                if isinstance(groups, list):
+                    var_name2grad = {}
+                    for i in range(len(vars)):
+                        var = vars[i]
+                        grad = grads[i]
+                        if grad is not None:
+                            var_name2grad[var.name] = (i, grad)
+                    grads_split = []
+                    for group in groups:
+                        grad_group = []
+                        for var in group:
+                            if var.name in var_name2grad:
+                                grad_group.append(var_name2grad[var.name])
+                                del var_name2grad[var.name]
+                        grads_split.append(grad_group)
+                    for _, grad in var_name2grad.items():
+                        grads_split.append([grad])
+                elif groups > 0:
+                    grads_clean = [(i, grad) for i, grad in enumerate(grads) if grad is not None]
+                    grads_split = split_list(grads_clean, groups)
+
+                reduce_ops = [None] * len(vars)
+                for group in grads_split:
+                    index_group, grad_group = [list(t) for t in zip(*group)]
+                    reduce_ops_group = _grouped_allreduce_cond(grad_group,
+                                                               device_dense=device_dense,
+                                                               device_sparse=device_sparse,
+                                                               compression=compression,
+                                                               op=op,
+                                                               prescale_factor=prescale_factor,
+                                                               postscale_factor=postscale_factor)
+                    for i in range(len(index_group)):
+                        reduce_ops[index_group[i]] = reduce_ops_group[i]
+                return reduce_ops
+
+            return [_allreduce_cond(grad,
+                                    device_dense=device_dense,
+                                    device_sparse=device_sparse,
+                                    compression=compression,
+                                    op=op,
+                                    prescale_factor=prescale_factor,
+                                    postscale_factor=postscale_factor)
                     if grad is not None else grad
                     for grad in grads]
 
@@ -249,6 +401,15 @@ def _make_allreduce_grads_fn(name, device_dense, device_sparse,
         return _make_subgraph(allreduce_grads)
     else:
         return allreduce_grads
+
+
+def _make_allreduce_grads_fn(name, device_dense, device_sparse,
+                             compression, sparse_as_dense, op,
+                             gradient_predivide_factor, groups):
+    groups = vars_to_refs(groups) if isinstance(groups, list) else groups
+    return _make_cached_allreduce_grads_fn(name, device_dense, device_sparse,
+                                           compression, sparse_as_dense, op,
+                                           gradient_predivide_factor, groups)
 
 
 try:
@@ -269,14 +430,34 @@ if _LegacyOptimizer is not None:
 
         def __init__(self, optimizer, name=None, use_locking=False, device_dense='',
                     device_sparse='', compression=Compression.none,
-                    sparse_as_dense=False, op=Average):
+                    sparse_as_dense=False, op=Average, gradient_predivide_factor=1.0,
+                    backward_passes_per_step=1, average_aggregated_gradients=False,
+                    groups=None):
             if name is None:
                 name = "Distributed{}".format(type(optimizer).__name__)
             super(_DistributedOptimizer, self).__init__(name=name, use_locking=use_locking)
 
             self._optimizer = optimizer
             self._allreduce_grads = _make_allreduce_grads_fn(
-                name, device_dense, device_sparse, compression, sparse_as_dense, op)
+                name, device_dense, device_sparse, compression, sparse_as_dense, op,
+                gradient_predivide_factor, groups)
+
+            self._agg_helper = None
+            if backward_passes_per_step > 1:
+                if _executing_eagerly():
+                    raise ValueError(
+                        "backward_passes_per_step > 1 is not yet supported "
+                        "for _LegacyOptimizer with eager execution."
+                    )
+
+                self._agg_helper = LocalGradientAggregationHelper(
+                    backward_passes_per_step=backward_passes_per_step,
+                    allreduce_func=self._allreduce_grads,
+                    sparse_as_dense=sparse_as_dense,
+                    average_aggregated_gradients=average_aggregated_gradients,
+                    rank=rank(),
+                    optimizer_type=LocalGradientAggregationHelper._OPTIMIZER_TYPE_LEGACY,
+                )
 
         def compute_gradients(self, *args, **kwargs):
             """Compute gradients of all trainable variables.
@@ -287,15 +468,23 @@ if _LegacyOptimizer is not None:
             allreduce the gradients before returning them.
             """
             gradients = self._optimizer.compute_gradients(*args, **kwargs)
-            if size() > 1:
-                grads, vars = zip(*gradients)
-                avg_grads = self._allreduce_grads(grads)
-                return list(zip(avg_grads, vars))
+            grads, vars = zip(*gradients)
+            if self._agg_helper:
+                avg_grads = self._agg_helper.compute_gradients(grads, vars)
             else:
-                return gradients
+                avg_grads = self._allreduce_grads(grads, vars)
+            return list(zip(avg_grads, vars))
 
         def apply_gradients(self, *args, **kwargs):
             """Calls this same method on the underlying optimizer."""
+            if self._agg_helper:
+                return self._agg_helper.apply_gradients(
+                    lambda: self._optimizer.apply_gradients(*args, **kwargs),
+                    self._optimizer,
+                    *args,
+                    **kwargs,
+                )
+
             return self._optimizer.apply_gradients(*args, **kwargs)
 
         def get_slot(self, *args, **kwargs):
@@ -333,15 +522,15 @@ if _LegacyOptimizer is not None:
                 initializer=tf.zeros_initializer)
             self._is_first_step = tf.cast(tf.math.equal(self._step_count, 0), dtype=tf.bool)
             self._is_comm_step  = tf.cast(tf.math.equal(self._step_count % self._backward_passes_per_step, self._backward_passes_per_step - 1), dtype=tf.bool)
-        
+
         def _apply_shared(self, var, get_update_op):
             start_slot = self._get_or_make_slot(var, "delta_start")
 
             # initialize start on the first step
-            assign_op = tf.cond(self._is_first_step, 
-                lambda: start_slot.assign(var, use_locking=self.use_locking).op, 
+            assign_op = tf.cond(self._is_first_step,
+                lambda: start_slot.assign(var, use_locking=self.use_locking).op,
                 tf.no_op)
-            
+
             with tf.control_dependencies([assign_op]):
                 update_op = get_update_op()
                 with tf.control_dependencies([update_op]):
@@ -358,7 +547,7 @@ if _LegacyOptimizer is not None:
                         new_start = start_slot.assign_add(global_delta, use_locking=self.use_locking)
                         # var = start
                         return var.assign(new_start, use_locking=self.use_locking).op
-                    
+
                     # if its a communication step, then apply logic above
                     # if its not a communication step then just have the underlying
                     # optimizer update the model parameters according to its logic
@@ -410,7 +599,9 @@ if _LegacyOptimizer is not None:
 def DistributedOptimizer(optimizer, name=None, use_locking=False, device_dense='',
                          device_sparse='', compression=Compression.none,
                          sparse_as_dense=False, backward_passes_per_step=1,
-                         op=Average):
+                         op=Average, gradient_predivide_factor=1.0,
+                         average_aggregated_gradients=False,
+                         num_groups=0, groups=None):
     """Construct a new DistributedOptimizer, which uses another optimizer
     under the hood for computing single-process gradient values and
     applying gradient updates after the gradient values have been combined
@@ -428,10 +619,10 @@ def DistributedOptimizer(optimizer, name=None, use_locking=False, device_dense='
         See Optimizer.__init__ for more info.
       device_dense:
         Device to be used for dense tensors. Uses GPU by default
-        if Horovod was built with HOROVOD_GPU_ALLREDUCE.
+        if Horovod was built with HOROVOD_GPU_OPERATIONS.
       device_sparse:
         Device to be used for sparse tensors. Uses GPU by default
-        if Horovod was built with HOROVOD_GPU_ALLGATHER.
+        if Horovod was built with HOROVOD_GPU_OPERATIONS.
       compression:
         Compression algorithm used during allreduce to reduce the amount
         of data sent during each parameter update step.  Defaults to
@@ -447,25 +638,83 @@ def DistributedOptimizer(optimizer, name=None, use_locking=False, device_dense='
       op:
         The reduction operation to use when combining gradients across
         different ranks.
+      gradient_predivide_factor:
+        If op == Average, gradient_predivide_factor splits the averaging
+        before and after the sum. Gradients are scaled by
+        1.0 / gradient_predivide_factor before the sum and
+        gradient_predivide_factor / size after the sum.
+      average_aggregated_gradients:
+        Whether to average the aggregated gradients that have been accumulated
+        over multiple mini-batches. If true divides gradients updates by
+        backward_passes_per_step. Only applicable for backward_passes_per_step > 1.
+      num_groups:
+        Number of groups to assign gradient allreduce ops to for explicit
+        grouping. Defaults to no explicit groups.
+      groups:
+        The parameter to group the gradient allreduce ops. Accept values is a
+        non-negative integer or a list of list of tf.Variable.
+        If groups is a non-negative integer, it is the number of groups to assign
+        gradient allreduce ops to for explicit grouping.
+        If groups is a list of list of tf.Variable. Variables in the same
+        inner list will be assigned to the same group, while parameter that does
+        not appear in any list will form a group itself.
+        Defaults as None, which is no explicit groups.
     """
+    if gradient_predivide_factor != 1.0:
+        if rocm_built():
+            raise ValueError('gradient_predivide_factor not supported yet with ROCm')
+        if op != Average:
+            raise ValueError('gradient_predivide_factor not supported with op != Average')
+
+    if op == Adasum and average_aggregated_gradients:
+        raise ValueError('Adasum does not support average_aggregated_gradients == True')
+
+    if num_groups != 0:
+        warnings.warn('Parameter `num_groups` has been replaced by `groups` '
+                      'and will be removed in v0.23.0.', DeprecationWarning)
+        if groups is None:
+            groups = num_groups
+
+    if groups is not None:
+        if not (isinstance(groups, list) or groups > 0):
+            raise ValueError('groups should be a non-negative integer or '
+                            'a list of list of tf.Variable.')
+
     if isinstance(optimizer, _LegacyOptimizer):
         if op == Adasum:
             return _DistributedAdasumOptimizer(optimizer, name, use_locking, device_dense,
                                             device_sparse, compression, backward_passes_per_step)
-        else:
-            if backward_passes_per_step > 1:
-                raise ValueError('backward_passes_per_step>1 is not supported yet with '
-                                 'op != Adasum')
-            return _DistributedOptimizer(optimizer, name, use_locking, device_dense,
-                                        device_sparse, compression, sparse_as_dense, op)
+
+        return _DistributedOptimizer(
+            optimizer=optimizer,
+            name=name,
+            use_locking=use_locking,
+            device_dense=device_dense,
+            device_sparse=device_sparse,
+            compression=compression,
+            sparse_as_dense=sparse_as_dense,
+            op=op,
+            gradient_predivide_factor=gradient_predivide_factor,
+            backward_passes_per_step=backward_passes_per_step,
+            average_aggregated_gradients=average_aggregated_gradients,
+            groups=groups
+        )
     elif isinstance(optimizer, tf.keras.optimizers.Optimizer):
         if op == Adasum:
             raise ValueError('op == Adasum is not supported yet with Keras')
-        if backward_passes_per_step > 1:
-            raise ValueError('backward_passes_per_step > 1 is not supported yet with Keras')
+
         import horovod.tensorflow.keras as hvd_k
-        return hvd_k.DistributedOptimizer(optimizer, name, device_dense, device_sparse,
-                                          compression, sparse_as_dense)
+        return hvd_k.DistributedOptimizer(
+            optimizer=optimizer,
+            name=name,
+            device_dense=device_dense,
+            device_sparse=device_sparse,
+            compression=compression,
+            sparse_as_dense=sparse_as_dense,
+            gradient_predivide_factor=gradient_predivide_factor,
+            backward_passes_per_step=backward_passes_per_step,
+            average_aggregated_gradients=average_aggregated_gradients,
+        )
     else:
         raise ValueError('Provided optimizer doesn\'t inherit from either legacy '
                          'TensorFlow or Keras optimizer: %s' % optimizer)
@@ -474,7 +723,8 @@ def DistributedOptimizer(optimizer, name=None, use_locking=False, device_dense='
 if hasattr(tf, 'GradientTape'):
     class _DistributedGradientTape(tf.GradientTape):
         def __init__(self, tape, device_dense, device_sparse, compression, sparse_as_dense, op,
-                     persistent=False, watch_accessed_variables=True):
+                     gradient_predivide_factor, groups, persistent=False,
+                     watch_accessed_variables=True):
             if hasattr(tape, '_watch_accessed_variables'):
                 super(self.__class__, self).__init__(persistent, watch_accessed_variables)
             else:
@@ -483,19 +733,17 @@ if hasattr(tf, 'GradientTape'):
             self._tape = tape
             self._allreduce_grads = _make_allreduce_grads_fn(
                 'DistributedGradientTape', device_dense, device_sparse, compression,
-                sparse_as_dense, op)
+                sparse_as_dense, op, gradient_predivide_factor, groups)
 
         def gradient(self, target, sources, output_gradients=None):
             gradients = super(self.__class__, self).gradient(target, sources, output_gradients)
-            if size() > 1:
-                return self._allreduce_grads(gradients)
-            else:
-                return gradients
+            return self._allreduce_grads(gradients, sources)
 
 
     def DistributedGradientTape(gradtape, device_dense='', device_sparse='',
                                 compression=Compression.none, sparse_as_dense=False,
-                                op=Average):
+                                op=Average, gradient_predivide_factor=1.0,
+                                num_groups=0, groups=None):
         """A tape that wraps another tf.GradientTape, using an allreduce to
         combine gradient values before applying gradients to model weights.
 
@@ -504,10 +752,10 @@ if hasattr(tf, 'GradientTape'):
             GradientTape to use for computing gradients and applying updates.
           device_dense:
             Device to be used for dense tensors. Uses GPU by default
-            if Horovod was built with HOROVOD_GPU_ALLREDUCE.
+            if Horovod was built with HOROVOD_GPU_OPERATIONS.
           device_sparse:
             Device to be used for sparse tensors. Uses GPU by default
-            if Horovod was built with HOROVOD_GPU_ALLGATHER.
+            if Horovod was built with HOROVOD_GPU_OPERATIONS.
           compression:
             Compression algorithm used during allreduce to reduce the amount
             of data sent during each parameter update step.  Defaults to
@@ -519,13 +767,48 @@ if hasattr(tf, 'GradientTape'):
           op:
             The reduction operation to use when combining gradients across
             different ranks.
+          gradient_predivide_factor:
+            If op == Average, gradient_predivide_factor splits the averaging
+            before and after the sum. Gradients are scaled by
+            1.0 / gradient_predivide_factor before the sum and
+            gradient_predivide_factor / size after the sum.
+          num_groups:
+            Number of groups to assign gradient allreduce ops to for explicit
+            grouping. Defaults to no explicit groups.
+          groups:
+            The parameter to group the gradient allreduce ops. Accept values is a
+            non-negative integer or a list of list of tf.Variable.
+            If groups is a non-negative integer, it is the number of groups to assign
+            gradient allreduce ops to for explicit grouping.
+            If groups is a list of list of tf.Variable. Variables in the same
+            inner list will be assigned to the same group, while parameter that does
+            not appear in any list will form a group itself.
+            Defaults as None, which is no explicit groups.
         """
+        if gradient_predivide_factor != 1.0:
+            if rocm_built():
+                raise ValueError('gradient_predivide_factor not supported yet with ROCm')
+            if op != Average:
+                raise ValueError('gradient_predivide_factor not supported with op != Average')
+
+        if num_groups != 0:
+            warnings.warn('Parameter `num_groups` has been replaced by `groups` '
+                          'and will be removed in v0.23.0.', DeprecationWarning)
+            if groups is None:
+                groups = num_groups
+
+        if groups is not None:
+            if not (isinstance(groups, list) or groups > 0):
+                raise ValueError('groups should be a non-negative integer or '
+                                'a list of list of tf.Variable.')
+
         cls = type(gradtape.__class__.__name__, (gradtape.__class__,),
                    dict(_DistributedGradientTape.__dict__))
         if hasattr(gradtape, '_watch_accessed_variables'):
             return cls(gradtape._tape, device_dense, device_sparse, compression,
-                       sparse_as_dense, op, gradtape._persistent,
-                       gradtape._watch_accessed_variables)
+                       sparse_as_dense, op, gradient_predivide_factor, groups,
+                       gradtape._persistent, gradtape._watch_accessed_variables)
         else:
             return cls(gradtape._tape, device_dense, device_sparse, compression,
-                       sparse_as_dense, op, gradtape._persistent)
+                       sparse_as_dense, op, gradient_predivide_factor, groups,
+                       gradtape._persistent)

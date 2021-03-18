@@ -25,17 +25,19 @@ Develop within a virtual environment to avoid dependency issues:
 
 We recommend installing package versions that match with those under test in
 `Buildkite <https://github.com/horovod/horovod/blob/master/.buildkite/gen-pipeline.sh>`__.
-
-For example:
+The following versions are recommended (see default versions defined through :code:`ARG` in
+`Dockerfile.test.cpu <https://github.com/horovod/horovod/blob/master/Dockerfile.test.cpu>`__ and
+`Dockerfile.test.gpu <https://github.com/horovod/horovod/blob/master/Dockerfile.test.gpu>`__ file.
+The versions with CPU support can be installed through the provided :code:`setup.py` file:
 
 .. code-block:: bash
 
-    $ pip install tensorflow==1.14.0
-    $ pip install keras==2.2.4
-    $ pip install torch==1.1.0 torchvision
-    $ pip install mock pytest pytest-forked
-    $ pip install h5py future scipy mpi4py pyspark mxnet
+    pip install -e .[dev,test]
 
+You can find all other non-Python packages that need to be installed on your system for Horovod to build
+in the `Dockerfile.test.cpu <https://github.com/horovod/horovod/blob/master/Dockerfile.test.cpu>`__ and
+`Dockerfile.test.gpu <https://github.com/horovod/horovod/blob/master/Dockerfile.test.gpu>`__ files.
+Specifically, see all :code:`RUN apt-get install` lines.
 
 Build and Install
 -----------------
@@ -72,6 +74,28 @@ Horovod has unit tests for all frameworks you can run from the tests directory:
 **Note:** You will need PySpark and Java to run the Spark tests.
 
 **IMPORTANT:** Some tests contain GPU-only codepaths that will be skipped if running without GPU support.
+
+
+Continuous Integration
+----------------------
+
+Horovod uses `Buildkite <https://buildkite.com/horovod/horovod>`__ for continuous integration in AWS running on both
+Intel CPU hardware and NVIDIA GPUs (with NCCL).  Tests are run once per night on master automatically, and on each
+commit to a remote branch.
+
+Buildkite test configurations are defined in
+`docker-compose.test.yml <https://github.com/horovod/horovod/blob/master/docker-compose.test.yml>`__.  Each test
+configuration defines a Docker image that is built from either
+`Docker.test.cpu <https://github.com/horovod/horovod/blob/master/Dockerfile.test.cpu>`__ (for CPU tests) or
+`Docker.test.gpu <https://github.com/horovod/horovod/blob/master/Dockerfile.test.gpu>`__ (for GPU tests).
+
+Individual tests are run on each configuration as defined in
+`gen-pipeline.sh <https://github.com/horovod/horovod/blob/master/.buildkite/gen-pipeline.sh>`__.  Every test
+configuration needs to also be defined here in order to be run at test time.  Each time ``run_test`` is called
+a new test artifact will be generated in Buildkite that either succeeds or fails depending on exit code.
+
+In our AWS configuration, GPU tests are run with 4 GPUs per container. Most tests are run with 2 worker processes
+each, however, model parallelism require 2 GPUs per worker, requiring 4 GPUs total.
 
 
 Documentation
@@ -197,7 +221,7 @@ Finally, you can start using your new compressor by passing it to the ``Distribu
     opt = hvd.DistributedOptimizer(opt, compression=hvd.Compression.custom)
 
 
-Horovod in Spark
+Horovod on Spark
 ----------------
 
 The ``horovod.spark`` package makes it easy to run Horovod jobs in Spark clusters. The following section
@@ -229,6 +253,17 @@ The following diagram illustrates this process:
 .. image:: _static/spark-mpi.png
 
 
+Elastic Horovod on Spark
+------------------------
+
+Elastic Horovod on Spark has a few constraints:
+
+- each host has at most a single slot, which simplifies auto-scaling on Spark
+  - for this the host hash includes the index of the task
+  - this dis-allows shared memory across tasks running on the same host
+  - see "Host Hash" below.
+
+
 Host Hash
 ~~~~~~~~~
 
@@ -238,8 +273,8 @@ There can be multiple executors running for your Horovod job on the same host, b
 Hence each executor gets its own host hash.
 
 If you require each Python function to run in their own task process within a Spark executor,
-then the index of the task has to become part of the host hash as well. This requirement hasn't been
-observed so far. This would also increase the complexity of the MPI cluster.
+then the index of the task has to become part of the host hash as well. This has only been shown useful
+for Elastic Horovod on Spark, but there only for simplification.
 
 
 Release Process
@@ -290,7 +325,7 @@ Upload to PyPI using `Twine <https://pypi.org/project/twine>`_:
     $ twine upload -r pypi dist/horovod-0.18.0.tar.gz
 
 Create a `PyPI <https://pypi.org>`_ account if you don’t have one. Then ask someone from the Horovod TSC
-to add you to the horovod project.
+to add you to the Horovod project.
 
 Verify that the latest version of Horovod is now available:
 
@@ -302,8 +337,8 @@ Verify that the latest version of Horovod is now available:
 Build Docker Images
 ~~~~~~~~~~~~~~~~~~~
 
-Create a `Docker Hub <https://cloud.docker.com>`_.  Ask someone from the Horovod TSC to add you to the
-horovod project.
+Create a `Docker Hub <https://cloud.docker.com>`_ account.  Ask someone from the Horovod TSC to add you to the
+Horovod project.
 
 From a clean copy of the ``horovod`` repository on a Linux machine:
 
@@ -314,17 +349,15 @@ From a clean copy of the ``horovod`` repository on a Linux machine:
 If you have trouble connecting to external URLs, try changing ``docker build ...`` to
 ``docker build --network host ...`` in ``build-docker-images.sh``.
 
-Upload artifacts for Python 2.7 and Python 3.6, CPU and GPU:
+Upload artifacts for Python 3.6, CPU and GPU:
 
 .. code-block:: bash
 
     $ docker login
-    $ docker push horovod/horovod:0.18.1-tf1.14.0-torch1.2.0-mxnet1.5.0-py2.7-gpu
     $ docker push horovod/horovod:0.18.1-tf1.14.0-torch1.2.0-mxnet1.5.0-py3.6-gpu
-    $ docker push horovod/horovod:0.18.1-tf1.14.0-torch1.2.0-mxnet1.5.0-py2.7-cpu
     $ docker push horovod/horovod:0.18.1-tf1.14.0-torch1.2.0-mxnet1.5.0-py3.6-cpu
 
-Check the horovod `Docker Hub project <https://cloud.docker.com/u/horovod/repository/docker/horovod/horovod>`_
+Check the Horovod `Docker Hub project <https://cloud.docker.com/u/horovod/repository/docker/horovod/horovod>`_
 to verify that the image artifacts were successfully uploaded.
 
 .. inclusion-marker-end-do-not-remove

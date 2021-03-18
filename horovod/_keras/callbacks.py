@@ -13,6 +13,9 @@
 # limitations under the License.
 # ==============================================================================
 
+from distutils.version import LooseVersion
+import warnings
+
 import horovod.tensorflow as hvd
 import tensorflow as tf
 
@@ -51,9 +54,14 @@ class MetricAverageCallbackImpl(object):
         self.allreduce_ops = {}
         self.device = device
 
+        if LooseVersion(tf.__version__) >= LooseVersion("2.3"):
+            warnings.warn(
+                "Some callbacks may not have access to the averaged metrics, "
+                "see https://github.com/horovod/horovod/issues/2440")
+
     def _make_variable(self, metric, value):
-        with tf.name_scope('MetricAverageCallback'):
-            var = tf.Variable(value, name=metric)
+        with self.backend.name_scope('MetricAverageCallback'):
+            var = self.backend.variable(value, name=metric)
             self.backend.get_session().run(var.initializer)
             allreduce_op = hvd.allreduce(var, device_dense=self.device)
             return var, allreduce_op
@@ -66,7 +74,7 @@ class MetricAverageCallbackImpl(object):
         for metric, value in sorted(logs.items()):
             if hvd._executing_eagerly():
                 reduced_logs[metric] = \
-                    hvd.allreduce(tf.constant(value, name=metric)).numpy()
+                    hvd.allreduce(self.backend.constant(value, name=metric)).numpy()
             else:
                 if metric not in self.variables:
                     self.variables[metric], self.allreduce_ops[metric] = \
@@ -85,7 +93,7 @@ class MetricAverageCallbackImpl(object):
 
 
 class LearningRateScheduleCallbackImpl(object):
-    def __init__(self, backend, multiplier, start_epoch=0, end_epoch=None, staircase=True,
+    def __init__(self, backend, initial_lr, multiplier, start_epoch=0, end_epoch=None, staircase=True,
                  momentum_correction=True, steps_per_epoch=None, *args):
         super(LearningRateScheduleCallbackImpl, self).__init__(*args)
         self.backend = backend
@@ -93,7 +101,7 @@ class LearningRateScheduleCallbackImpl(object):
         self.end_epoch = end_epoch
         self.staircase = staircase
         self.momentum_correction = momentum_correction
-        self.initial_lr = None
+        self.initial_lr = initial_lr
         self.restore_momentum = None
         self.steps_per_epoch = steps_per_epoch
         self.current_epoch = None
@@ -103,6 +111,9 @@ class LearningRateScheduleCallbackImpl(object):
             self.multiplier = lambda epoch: multiplier
         else:
             self.multiplier = multiplier
+
+        if self.initial_lr is None:
+            raise ValueError('Parameter `initial_lr` is required')
 
     def _autodetect_steps_per_epoch(self):
         if self.params.get('steps'):
@@ -134,7 +145,8 @@ class LearningRateScheduleCallbackImpl(object):
             self.restore_momentum = None
 
     def on_train_begin(self, logs=None):
-        self.initial_lr = self.backend.get_value(self.model.optimizer.lr)
+        if self.initial_lr is None:
+            self.initial_lr = self.backend.get_value(self.model.optimizer.lr)
         if not self.staircase and not self.steps_per_epoch:
             self.steps_per_epoch = self._autodetect_steps_per_epoch()
 
@@ -164,7 +176,7 @@ class LearningRateScheduleCallbackImpl(object):
 
 
 class LearningRateWarmupCallbackImpl(LearningRateScheduleCallbackImpl):
-    def __init__(self, backend, warmup_epochs=5, momentum_correction=True, steps_per_epoch=None,
+    def __init__(self, backend, initial_lr, warmup_epochs=5, momentum_correction=True, steps_per_epoch=None,
                  verbose=0, *args):
         def multiplier(epoch):
             # Adjust epoch to produce round numbers at the end of each epoch, so that TensorBoard
@@ -172,14 +184,15 @@ class LearningRateWarmupCallbackImpl(LearningRateScheduleCallbackImpl):
             epoch += 1. / self.steps_per_epoch
             return 1. / hvd.size() * (epoch * (hvd.size() - 1) / warmup_epochs + 1)
         super(LearningRateWarmupCallbackImpl, self).__init__(
-            backend, multiplier, start_epoch=0, end_epoch=warmup_epochs, staircase=False,
-            momentum_correction=momentum_correction, steps_per_epoch=steps_per_epoch, *args)
+            backend, initial_lr, multiplier, start_epoch=0, end_epoch=warmup_epochs, staircase=False,
+            momentum_correction=momentum_correction, steps_per_epoch=steps_per_epoch,
+            *args)
         self.verbose = verbose
 
     def on_epoch_end(self, epoch, logs=None):
         super(LearningRateWarmupCallbackImpl, self).on_epoch_end(epoch, logs)
 
-        if epoch == self.end_epoch - 1 and self.verbose > 0:
+        if epoch == self.end_epoch - 1 and self.verbose > 0 and hvd.rank() == 0:
             new_lr = self.backend.get_value(self.model.optimizer.lr)
             print('\nEpoch %d: finished gradual learning rate warmup to %g.' %
                   (epoch + 1, new_lr))

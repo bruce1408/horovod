@@ -30,6 +30,7 @@ public:
   TensorQueue() = default;
   TensorQueue(const TensorQueue&) = delete;
   Status AddToTensorQueue(TensorTableEntry& e, Request& message);
+  Status AddToTensorQueueMulti(std::vector<TensorTableEntry>& entries, std::vector<Request>& messages);
 
   void FinalizeTensorQueue(std::vector<StatusCallback>& callbacks_buffer);
 
@@ -45,6 +46,8 @@ public:
   void PopMessagesFromQueue(std::deque<Request>& message_queue_buffer);
 
   void PushMessageToQueue(Request& message);
+
+  void PushMessagesToQueue(std::deque<Request>& messages);
 
   void RemoveJoinTensor();
 

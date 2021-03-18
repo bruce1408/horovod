@@ -15,10 +15,17 @@
 # limitations under the License.
 # =============================================================================
 
-from contextlib import contextmanager
-from multiprocessing import Process, Queue
+import json
+import multiprocessing
 import os
+import sys
 import sysconfig
+import warnings
+
+from contextlib import contextmanager
+
+from horovod.common.exceptions import get_version_mismatch_message, HorovodVersionMismatchError
+
 
 EXTENSIONS = ['tensorflow', 'torch', 'mxnet']
 
@@ -47,8 +54,11 @@ def check_extension(ext_name, ext_env_var, pkg_path, *args):
     full_path = get_extension_full_path(pkg_path, *args)
     if not os.path.exists(full_path):
         raise ImportError(
-            'Extension %s has not been built.  If this is not expected, reinstall '
-            'Horovod with %s=1 to debug the build error.' % (ext_name, ext_env_var))
+            'Extension {} has not been built: {} not found\n'
+            'If this is not expected, reinstall Horovod with {}=1 to debug the build error.'.format(
+                ext_name, full_path, ext_env_var
+            )
+        )
 
 
 def _check_extension_lambda(ext_base_name, fn, fn_desc, verbose):
@@ -83,9 +93,11 @@ def _check_extension_lambda(ext_base_name, fn, fn_desc, verbose):
 
         queue.put(result)
 
-    queue = Queue()
-    p = Process(target=_target_fn,
-                args=(ext_base_name, fn, fn_desc, queue, verbose))
+    # 'fork' is required because horovodrun is a frozen executable
+    ctx = multiprocessing.get_context('fork')
+    queue = ctx.Queue()
+    p = ctx.Process(target=_target_fn,
+                    args=(ext_base_name, fn, fn_desc, queue, verbose))
     p.daemon = True
     p.start()
     p.join()
@@ -129,7 +141,7 @@ def mpi_built(verbose=False):
             ext_base_name, built_fn, 'built with MPI', verbose)
         if result is not None:
             return result
-    return False
+    return None
 
 
 @_cache
@@ -140,9 +152,7 @@ def gloo_built(verbose=False):
             ext_base_name, built_fn, 'built with Gloo', verbose)
         if result is not None:
             return result
-    raise RuntimeError('Failed to determine if Gloo support has been built. '
-                       'Run again with --verbose for more details.')
-
+    return None
 
 @_cache
 def nccl_built(verbose=False):
@@ -152,9 +162,7 @@ def nccl_built(verbose=False):
             ext_base_name, built_fn, 'built with NCCL', verbose)
         if result is not None:
             return result
-    raise RuntimeError('Failed to determine if NCCL support has been built. '
-                       'Run again with --verbose for more details.')
-
+    return None
 
 @_cache
 def ddl_built(verbose=False):
@@ -164,9 +172,7 @@ def ddl_built(verbose=False):
             ext_base_name, built_fn, 'built with DDL', verbose)
         if result is not None:
             return result
-    raise RuntimeError('Failed to determine if DDL support has been built. '
-                       'Run again with --verbose for more details.')
-
+    return None
 
 @_cache
 def ccl_built(verbose=False):
@@ -176,9 +182,7 @@ def ccl_built(verbose=False):
             ext_base_name, built_fn, 'built with CCL', verbose)
         if result is not None:
             return result
-    raise RuntimeError('Failed to determine if CCL support has been built. '
-                       'Run again with --verbose for more details.')
-
+    return None
 
 @contextmanager
 def env(**kwargs):
@@ -220,6 +224,8 @@ def get_average_backwards_compatibility_fun(reduce_ops):
                 raise ValueError('The op parameter supersedes average. Please provide only one of them.')
             return op
         elif average != None:
+            warnings.warn('Parameter `average` has been replaced with `op` and will be removed in v0.21.0',
+                          DeprecationWarning)
             return reduce_ops.Average if average else reduce_ops.Sum
         else:
             return reduce_ops.Average
@@ -233,3 +239,22 @@ def num_rank_is_power_2(num_rank):
     TODO support non-power of 2 ranks.
     """
     return num_rank != 0 and ((num_rank & (num_rank -1)) == 0)
+
+def split_list(l, n):
+    """
+    Splits list l into n approximately even sized chunks.
+    """
+    d, r = divmod(len(l), n)
+    return [l[i * d + min(i, r):(i + 1) * d + min(i + 1, r)] for i in range(n)]
+
+
+def check_installed_version(name, version, exception=None):
+    file_path = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),\
+        os.pardir, "metadata.json"))
+    with open(file_path) as f:
+        installed_version = json.load(f).get(name)
+        if installed_version != version:
+            if exception is None:
+                warnings.warn(get_version_mismatch_message(name, version, installed_version))
+            else:
+                raise HorovodVersionMismatchError(name, version, installed_version) from exception

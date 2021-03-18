@@ -15,43 +15,34 @@
 
 import os
 import sys
-import threading
-import time
 
-from horovod.spark.task import task_service
-from horovod.spark.driver import driver_service
-from horovod.run.common.util import codec, secret
-
-
-def parent_process_monitor(initial_ppid):
-    try:
-        while True:
-            if initial_ppid != os.getppid():
-                # Parent process died, terminate
-                os._exit(1)
-            time.sleep(1)
-    except:
-        # Avoids an error message during Python interpreter shutdown.
-        pass
+from horovod.spark.task import task_exec
+from horovod.runner.common.util import codec
 
 
 def main(driver_addresses, settings):
-    # Die if parent process terminates
-    bg = threading.Thread(target=parent_process_monitor, args=(os.getppid(),))
-    bg.daemon = True
-    bg.start()
+    # prepend HOROVOD_SPARK_PYTHONPATH to PYTHONPATH
+    if 'HOROVOD_SPARK_PYTHONPATH' in os.environ:
+        ppath = os.environ['HOROVOD_SPARK_PYTHONPATH']
 
-    key = codec.loads_base64(os.environ[secret.HOROVOD_SECRET_KEY])
-    rank = int(os.environ['OMPI_COMM_WORLD_RANK'])
-    driver_client = driver_service.SparkDriverClient(driver_addresses, key,
-                                                     verbose=settings.verbose)
-    task_index = driver_client.task_index_by_rank(rank)
-    task_addresses = driver_client.all_task_addresses(task_index)
-    task_client = task_service.SparkTaskClient(task_index, task_addresses, key,
-                                               verbose=settings.verbose)
-    fn, args, kwargs = driver_client.code()
-    result = fn(*args, **kwargs)
-    task_client.register_code_result(result)
+        # add injected HOROVOD_SPARK_PYTHONPATH to sys.path
+        for p in reversed(ppath.split(os.pathsep)):
+            sys.path.insert(1, p)  # don't put it in front which is usually .
+
+        if 'PYTHONPATH' in os.environ:
+            ppath = os.pathsep.join([ppath, os.environ['PYTHONPATH']])
+        os.environ['PYTHONPATH'] = ppath
+
+    # change current working dir to where the Spark worker runs
+    # because orted runs this script where mpirun was executed
+    # this env var is injected by the Spark task service
+    work_dir = os.environ.get('HOROVOD_SPARK_WORK_DIR')
+    if work_dir:
+        if settings.verbose >= 2:
+            print("Changing cwd from {} to {}".format(os.getcwd(), work_dir))
+        os.chdir(work_dir)
+
+    task_exec(driver_addresses, settings, 'OMPI_COMM_WORLD_RANK', 'OMPI_COMM_WORLD_LOCAL_RANK')
 
 
 if __name__ == '__main__':

@@ -46,6 +46,26 @@ To run on hosts specified in a hostfile:
 
     $ horovodrun -np 6 -hostfile myhostfile python train.py
 
+
+Requirements
+~~~~~~~~~~~~
+
+Usage of ``horovodrun`` requires one of the following:
+
+* Open MPI >= 2.X
+* Spectrum MPI
+* MPICH
+* OpenRTE
+* Gloo
+* Intel(R) MPI
+
+If you do not have MPI installed, you can run ``horovodrun`` using Gloo.  Gloo dependencies come with Horovod
+automatically, and only require CMake to be available on your system at the time you install Horovod.
+
+If you wish to use a different version of MPI, you may still be able to run Horovod using `mpirun <mpirun.rst>`
+directly.
+
+
 Failures due to SSH issues
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 The host where ``horovodrun`` is executed must be able to SSH to all other
@@ -77,5 +97,11 @@ Advanced: Run Horovod with Open MPI
 In some advanced cases you might want fine-grained control over options passed to Open MPI.
 To learn how to run Horovod training directly using Open MPI,
 read `Run Horovod with Open MPI <mpirun.rst>`_.
+
+Run Horovod with Intel(R) MPI
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+``horovodrun`` automatically converts some parameters to the format supported by Intel(R) MPI ``mpirun``. The set of allowed options includes ``-np``, ``-H`` and
+ssh arguments (-p, -i). Intel(R) MPI ``mpirun`` does not support MCA parameters, but you can set some of the options via `environment variables <https://software.intel.com/content/www/us/en/develop/documentation/mpi-developer-reference-linux/environment-variable-reference.html>`__. 
+For additional information refer to `Intel(R) MPI official documentation <https://software.intel.com/content/www/us/en/develop/documentation/mpi-developer-reference-linux/top/command-reference/mpiexec-hydra/global-options.html>`__.
 
 .. inclusion-marker-end-do-not-remove

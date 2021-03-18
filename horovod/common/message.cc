@@ -1,6 +1,7 @@
 // Copyright 2016 The TensorFlow Authors. All Rights Reserved.
 // Modifications copyright (C) 2019 Uber Technologies, Inc.
 // Modifications copyright Microsoft
+// Modifications copyright (C) 2020, NVIDIA CORPORATION. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -62,6 +63,34 @@ const std::string& DataType_Name(DataType value) {
   }
 }
 
+std::size_t DataType_Size(DataType value) {
+  switch (value) {
+    case HOROVOD_UINT8:
+      return sizeof(u_int8_t);
+    case HOROVOD_INT8:
+      return sizeof(int8_t);
+    case HOROVOD_UINT16:
+      return sizeof(u_int16_t);
+    case HOROVOD_INT16:
+      return sizeof(int16_t);
+    case HOROVOD_INT32:
+      return sizeof(int32_t);
+    case HOROVOD_INT64:
+      return sizeof(int64_t);
+    case HOROVOD_FLOAT16:
+      return 2;
+    case HOROVOD_FLOAT32:
+      return sizeof(float);
+    case HOROVOD_FLOAT64:
+      return sizeof(double);
+    case HOROVOD_BOOL:
+      return sizeof(bool);
+    default:
+      throw std::logic_error("Type " + DataType_Name(value) +
+                             " is not supported.");
+  }
+}
+
 const std::string& Request::RequestType_Name(RequestType value) {
   switch (value) {
     case RequestType::ALLREDUCE:
@@ -79,6 +108,9 @@ const std::string& Request::RequestType_Name(RequestType value) {
     case RequestType::ADASUM:
       static const std::string adasum("ADASUM");
       return adasum;
+    case RequestType::ALLTOALL:
+      static const std::string alltoall("ALLTOALL");
+      return alltoall;
     default:
       static const std::string unknown("<unknown>");
       return unknown;
@@ -113,6 +145,18 @@ int32_t Request::device() const { return device_; }
 
 void Request::set_device(int32_t value) { device_ = value; }
 
+double Request::prescale_factor() const { return prescale_factor_; };
+
+double Request::postscale_factor() const { return postscale_factor_; };
+
+void Request::set_prescale_factor(const double prescale_factor) { prescale_factor_ = prescale_factor; };
+
+void Request::set_postscale_factor(const double postscale_factor) { postscale_factor_ = postscale_factor; };
+
+int32_t Request::group_id() const { return group_id_; }
+
+void Request::set_group_id(int32_t value) { group_id_ = value; }
+
 const std::vector<int64_t>& Request::tensor_shape() const {
   return tensor_shape_;
 }
@@ -137,6 +181,8 @@ void Request_ParseFromWire(Request& request,
   request.set_device(obj->device());
   request.set_tensor_shape(std::vector<int64_t>(obj->tensor_shape()->begin(),
                                                 obj->tensor_shape()->end()));
+  request.set_prescale_factor(obj->prescale_factor());
+  request.set_postscale_factor(obj->postscale_factor());
 }
 
 void Request_SerializeToWire(const Request& request,
@@ -155,6 +201,8 @@ void Request_SerializeToWire(const Request& request,
   request_builder.add_root_rank(request.root_rank());
   request_builder.add_device(request.device());
   request_builder.add_tensor_shape(tensor_shape_wire);
+  request_builder.add_prescale_factor(request.prescale_factor());
+  request_builder.add_postscale_factor(request.postscale_factor());
   obj = request_builder.Finish();
 }
 
@@ -249,6 +297,9 @@ const std::string& Response::ResponseType_Name(ResponseType value) {
     case ResponseType::ADASUM:
       static const std::string adasum("ADASUM");
       return adasum;
+    case ResponseType::ALLTOALL:
+      static const std::string alltoall("ALLTOALL");
+      return alltoall;
     case ResponseType::ERROR:
       static const std::string error("ERROR");
       return error;
@@ -296,6 +347,10 @@ void Response::add_tensor_name(const std::string& value) {
   tensor_names_.push_back(value);
 }
 
+void Response::add_tensor_name(std::string&& value) {
+  tensor_names_.push_back(std::move(value));
+}
+
 const std::string& Response::error_message() const { return error_message_; }
 
 void Response::set_error_message(const std::string& value) {
@@ -332,6 +387,14 @@ void Response::add_allgather_response(const Response& response) {
   }
 }
 
+double Response::prescale_factor() const { return prescale_factor_; };
+
+double Response::postscale_factor() const { return postscale_factor_; };
+
+void Response::set_prescale_factor(const double prescale_factor) { prescale_factor_ = prescale_factor; };
+
+void Response::set_postscale_factor(const double postscale_factor) { postscale_factor_ = postscale_factor; };
+
 void Response_ParseFromWire(Response& response,
                             const wire::Response* obj) {
   response.set_response_type((Response::ResponseType) obj->response_type());
@@ -344,6 +407,8 @@ void Response_ParseFromWire(Response& response,
       std::vector<int32_t>(obj->devices()->begin(), obj->devices()->end()));
   response.set_tensor_sizes(std::vector<int64_t>(obj->tensor_sizes()->begin(),
                                                  obj->tensor_sizes()->end()));
+  response.set_prescale_factor(obj->prescale_factor());
+  response.set_postscale_factor(obj->postscale_factor());
 }
 
 void Response::ParseFromBytes(Response& response, const uint8_t* input) {
@@ -370,6 +435,8 @@ void Response_SerializeToWire(const Response& response,
   response_builder.add_error_message(error_message_wire);
   response_builder.add_devices(devices_wire);
   response_builder.add_tensor_sizes(tensor_sizes_wire);
+  response_builder.add_prescale_factor(response.prescale_factor());
+  response_builder.add_postscale_factor(response.postscale_factor());
   obj = response_builder.Finish();
 }
 
@@ -399,6 +466,10 @@ void ResponseList::set_shutdown(bool value) { shutdown_ = value; }
 
 void ResponseList::add_response(const Response& value) {
   responses_.push_back(value);
+}
+
+void ResponseList::add_response(Response&& value) {
+  responses_.push_back(std::move(value));
 }
 
 void ResponseList::emplace_response(Response&& value) {

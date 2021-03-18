@@ -93,15 +93,16 @@ const TensorShape TorchTensor::shape() const {
 const void* TorchTensor::data() const { return tensor_.data_ptr(); }
 
 int64_t TorchTensor::size() const {
-# if TORCH_VERSION >= 1001000000
   return tensor_.element_size() * tensor_.numel();
-#else
-  return tensor_.type().elementSizeInBytes() * tensor_.numel();
-#endif
 }
 
-TorchOpContext::TorchOpContext(int device, ::torch::Tensor output)
-    : device_(device), output_(output) {}
+TorchOpContext::TorchOpContext(int device, ::torch::Tensor principal_output)
+    : device_(device), output_devices_{device}, outputs_{principal_output} {}
+
+void TorchOpContext::AddOutput(int device, ::torch::Tensor output) {
+  output_devices_.push_back(device);
+  outputs_.push_back(output);
+}
 
 Status
 TorchOpContext::AllocatePersistent(int64_t size,
@@ -113,14 +114,19 @@ TorchOpContext::AllocatePersistent(int64_t size,
 
 Status TorchOpContext::AllocateOutput(TensorShape shape,
                                       std::shared_ptr<Tensor>* tensor) {
+  return TorchOpContext::AllocateOutput(0, shape, tensor);
+}
+
+Status TorchOpContext::AllocateOutput(int output_index, TensorShape shape,
+                                      std::shared_ptr<Tensor>* tensor) {
   std::vector<int64_t> shape_vector;
   shape_vector.reserve(shape.dims());
   for (int idx = 0; idx < shape.dims(); ++idx) {
     shape_vector.push_back(shape.dim_size(idx));
   }
-  with_device device_context(device_);
-  output_.resize_(shape_vector);
-  *tensor = std::make_shared<TorchTensor>(output_);
+  with_device device_context(output_devices_.at(output_index));
+  outputs_.at(output_index).resize_(shape_vector);
+  *tensor = std::make_shared<TorchTensor>(outputs_.at(output_index));
   return Status::OK();
 }
 

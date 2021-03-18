@@ -13,23 +13,39 @@
 # limitations under the License.
 # ==============================================================================
 
-from __future__ import absolute_import
-
 import horovod.spark.common._namedtuple_fix
 
-from pyspark.ml import Estimator
+from pyspark.ml import Estimator, Model
 
 from horovod.spark.common import util
 from horovod.spark.common.backend import SparkBackend
-from horovod.spark.common.params import EstimatorParams
+from horovod.spark.common.params import EstimatorParams, ModelParams
 
 
 class HorovodEstimator(Estimator, EstimatorParams):
+    def fit(self, df, params=None):
+        """Fits the model to the DataFrame.
+
+        Args:
+            df: Input dataset, which is an instance of :py:class:`pyspark.sql.DataFrame`.
+            params: An optional param map that overrides embedded params.
+        Returns:
+            `HorovodModel` transformer wrapping the trained model.
+        """
+        return super(HorovodEstimator, self).fit(df, params)
+
     def fit_on_parquet(self, params=None):
+        """Trains the model on a saved Parquet file at `store.get_train_path()`.
+
+        Args:
+            params: An optional param map that overrides embedded params.
+
+        Returns:
+            Trained HorovodModel transformer of the appropriate subclass wrapping the trained model.
+        """
         if params:
             return self.copy(params)._fit_on_parquet()
-        else:
-            return self._fit_on_parquet()
+        return self._fit_on_parquet()
 
     def _fit_on_parquet(self):
         backend = self._get_or_create_backend()
@@ -66,7 +82,7 @@ class HorovodEstimator(Estimator, EstimatorParams):
     def _get_or_create_backend(self):
         backend = self.getBackend()
         if backend is None:
-            backend = SparkBackend(self.getNumProc())
+            backend = SparkBackend(self.getNumProc(), verbose=self.getVerbose())
         elif self.getNumProc() is not None:
             raise ValueError('At most one of parameters "backend" and "num_proc" may be specified')
         return backend
@@ -75,3 +91,21 @@ class HorovodEstimator(Estimator, EstimatorParams):
         store = self.getStore()
         last_ckpt_path = store.get_checkpoint_path(run_id)
         return last_ckpt_path is not None and store.exists(last_ckpt_path)
+
+
+class HorovodModel(Model, ModelParams):
+    def transform(self, df, params=None):
+        """
+        Transforms the input dataset with prediction columns representing model predictions.
+
+        Prediction column names default to <label_column>__output. Override column names
+        by calling `transformer.setOutputCols(col_names)`.
+
+        Args:
+            df: Input dataset, which is an instance of :py:class:`pyspark.sql.DataFrame`.
+            params: An optional param map that overrides embedded params.
+
+        Returns:
+            Transformed dataset.
+        """
+        return super(HorovodModel, self).transform(df, params)

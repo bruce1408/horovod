@@ -13,15 +13,8 @@
 # limitations under the License.
 # ==============================================================================
 
-import tensorflow as tf
-
-from distutils.version import LooseVersion
-if LooseVersion(tf.__version__) >= LooseVersion("1.4.0"):
-    from tensorflow import keras
-    from tensorflow.python.keras import backend as K
-else:
-    from tensorflow.contrib import keras
-    from tensorflow.contrib.keras import backend as K
+from tensorflow import keras
+from tensorflow.python.keras import backend as K
 
 from horovod._keras import callbacks as _impl
 
@@ -43,7 +36,7 @@ class BroadcastGlobalVariablesCallback(_impl.BroadcastGlobalVariablesCallbackImp
         Args:
             root_rank: Rank that will send data, other ranks will receive data.
             device: Device to be used for broadcasting. Uses GPU by default
-                    if Horovod was build with HOROVOD_GPU_BROADCAST.
+                    if Horovod was build with HOROVOD_GPU_OPERATIONS.
         """
         super(BroadcastGlobalVariablesCallback, self).__init__(K, root_rank, device)
 
@@ -65,7 +58,7 @@ class MetricAverageCallback(_impl.MetricAverageCallbackImpl, keras.callbacks.Cal
 
         Args:
             device: Device to be used for allreduce. Uses GPU by default
-                    if Horovod was build with HOROVOD_GPU_ALLREDUCE.
+                    if Horovod was build with HOROVOD_GPU_OPERATIONS.
         """
         super(MetricAverageCallback, self).__init__(K, device)
 
@@ -89,12 +82,13 @@ class LearningRateScheduleCallback(_impl.LearningRateScheduleCallbackImpl, keras
     `initial_lr` is the learning rate of the model optimizer at the start of the training.
     """
 
-    def __init__(self, multiplier, start_epoch=0, end_epoch=None, staircase=True,
+    def __init__(self, initial_lr, multiplier, start_epoch=0, end_epoch=None, staircase=True,
                  momentum_correction=True, steps_per_epoch=None):
         """
         Construct a new LearningRateScheduleCallback.
 
         Args:
+            initial_lr: Initial learning rate at the start of training.
             multiplier: A constant multiplier or a function `f(epoch) = lr'`
             start_epoch: The first epoch this adjustment will be applied to. Defaults to 0.
             end_epoch: The epoch this adjustment will stop applying (exclusive end).
@@ -107,7 +101,7 @@ class LearningRateScheduleCallback(_impl.LearningRateScheduleCallbackImpl, keras
                              epoch with Keras >= 2.0.0. Provide this value if you have an older
                              version of Keras.
         """
-        super(LearningRateScheduleCallback, self).__init__(K, multiplier, start_epoch, end_epoch,
+        super(LearningRateScheduleCallback, self).__init__(K, initial_lr, multiplier, start_epoch, end_epoch,
                                                            staircase, momentum_correction, steps_per_epoch)
 
 
@@ -123,27 +117,25 @@ class LearningRateWarmupCallback(_impl.LearningRateWarmupCallbackImpl, keras.cal
     ImageNet in 1 Hour". See https://arxiv.org/pdf/1706.02677.pdf for details.
 
     Math recap:
-                                                 batch
-        epoch               = full_epochs + ---------------
-                                            steps_per_epoch
 
-                               lr     size - 1
-        lr'(epoch)          = ---- * (-------- * epoch + 1)
-                              size     warmup
+    .. math::
 
-                               lr
-        lr'(epoch = 0)      = ----
-                              size
+        epoch &= full\\_epochs + \\frac{batch}{steps\\_per\\_epoch}
 
-        lr'(epoch = warmup) = lr
+        lr'(epoch) &= \\frac{lr}{size} * (\\frac{size - 1}{warmup} * epoch + 1)
+
+        lr'(epoch = 0) &= \\frac{lr}{size}
+
+        lr'(epoch = warmup) &= lr
     """
 
-    def __init__(self, warmup_epochs=5, momentum_correction=True, steps_per_epoch=None,
+    def __init__(self, initial_lr, warmup_epochs=5, momentum_correction=True, steps_per_epoch=None,
                  verbose=0):
         """
         Construct a new LearningRateWarmupCallback that will gradually warm up the learning rate.
 
         Args:
+            initial_lr: Initial learning rate at the start of training.
             warmup_epochs: The number of epochs of the warmup phase. Defaults to 5.
             momentum_correction: Apply momentum correction to optimizers that have momentum.
                                  Defaults to True.
@@ -152,5 +144,21 @@ class LearningRateWarmupCallback(_impl.LearningRateWarmupCallbackImpl, keras.cal
                              version of Keras.
             verbose: verbosity mode, 0 or 1.
         """
-        super(LearningRateWarmupCallback, self).__init__(K, warmup_epochs, momentum_correction,
+        super(LearningRateWarmupCallback, self).__init__(K, initial_lr, warmup_epochs, momentum_correction,
                                                          steps_per_epoch, verbose)
+
+
+class BestModelCheckpoint(keras.callbacks.ModelCheckpoint):
+    def __init__(self,
+                 monitor='val_loss',
+                 verbose=0,
+                 save_weights_only=False,
+                 mode='auto',
+                 save_freq='epoch'):
+        super(BestModelCheckpoint, self).__init__(filepath=None,
+                                                  monitor=monitor,
+                                                  verbose=verbose,
+                                                  save_best_only=True,
+                                                  save_weights_only=save_weights_only,
+                                                  mode=mode,
+                                                  save_freq=save_freq)

@@ -13,9 +13,11 @@
 // limitations under the License.
 // =============================================================================
 
-#if HAVE_CUDA
+#if HAVE_GPU
 #include "cuda_runtime.h"
 #include <THC/THC.h>
+#else
+#include <stdexcept>
 #endif
 
 #include "../common/common.h"
@@ -28,7 +30,7 @@ with_device::with_device(int device) {
   if (device == CPU_DEVICE_ID) {
     restore_device_ = CPU_DEVICE_ID;
   } else {
-#if HAVE_CUDA
+#if HAVE_GPU
     THCudaCheck(cudaGetDevice(&restore_device_));
     THCudaCheck(cudaSetDevice(device));
 #else
@@ -39,7 +41,7 @@ with_device::with_device(int device) {
 }
 
 with_device::~with_device() {
-#if HAVE_CUDA
+#if HAVE_GPU
   if (restore_device_ != CPU_DEVICE_ID) {
     THCudaCheck(cudaSetDevice(restore_device_));
   }

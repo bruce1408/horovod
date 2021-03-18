@@ -32,7 +32,7 @@ by installing an `nv_peer_memory <https://github.com/Mellanox/nv_peer_memory>`__
 
    **Note**: Open MPI 3.1.3 has an issue that may cause hangs.  The recommended fix is to downgrade to Open MPI 3.1.2 or upgrade to Open MPI 4.0.0.
 
-4. If you installed TensorFlow from `PyPI <https://pypi.org/project/tensorflow>`__, make sure that the ``g++-4.8.5`` or ``g++-4.9`` is installed.
+4. If you installed TensorFlow from `PyPI <https://pypi.org/project/tensorflow>`__, make sure that the ``g++-4.8.5`` or ``g++-4.9`` or above is installed.
 
    If you installed PyTorch from `PyPI <https://pypi.org/project/torch>`__, make sure that the ``g++-4.9`` or above is installed.
 
@@ -45,20 +45,20 @@ by installing an `nv_peer_memory <https://github.com/Mellanox/nv_peer_memory>`__
 
    .. code-block:: bash
 
-       $ HOROVOD_NCCL_HOME=/usr/local/nccl-<version> HOROVOD_GPU_ALLREDUCE=NCCL pip install --no-cache-dir horovod
+       $ HOROVOD_NCCL_HOME=/usr/local/nccl-<version> HOROVOD_GPU_OPERATIONS=NCCL pip install --no-cache-dir horovod
 
 
    If you installed NCCL 2 using the Ubuntu package, you can run:
 
    .. code-block:: bash
 
-       $ HOROVOD_GPU_ALLREDUCE=NCCL pip install --no-cache-dir horovod
+       $ HOROVOD_GPU_OPERATIONS=NCCL pip install --no-cache-dir horovod
    
    If you installed NCCL 2 using the `CentOS / RHEL package <https://docs.nvidia.com/deeplearning/sdk/nccl-install-guide/index.html#rhel_centos>`__, you can run:
 
    .. code-block:: bash
 
-       $ HOROVOD_NCCL_INCLUDE=/usr/include HOROVOD_NCCL_LIB=/usr/lib64 HOROVOD_GPU_ALLREDUCE=NCCL pip install --no-cache-dir horovod
+       $ HOROVOD_NCCL_INCLUDE=/usr/include HOROVOD_NCCL_LIB=/usr/lib64 HOROVOD_GPU_OPERATIONS=NCCL pip install --no-cache-dir horovod
 
 
 **Note**: Some models with a high computation to communication ratio benefit from doing allreduce on CPU, even if a
@@ -87,7 +87,7 @@ configure Horovod to use them as well:
 
 .. code-block:: bash
 
-    $ HOROVOD_GPU_ALLREDUCE=MPI HOROVOD_GPU_ALLGATHER=MPI HOROVOD_GPU_BROADCAST=MPI pip install --no-cache-dir horovod
+    $ HOROVOD_GPU_OPERATIONS=MPI pip install --no-cache-dir horovod
 
 
 **Note**: Allgather allocates an output tensor which is proportionate to the number of processes participating in the

@@ -27,11 +27,10 @@ class GlooController : public Controller {
 public:
   GlooController(ResponseCache& response_cache, TensorQueue& tensor_queue,
                  Timeline& timeline, ParameterManager& parameter_manager,
-                 GlooContext& gloo_context)
-      : Controller(response_cache, tensor_queue, timeline, parameter_manager),
+                 GroupTable& group_table, GlooContext& gloo_context)
+      : Controller(response_cache, tensor_queue, timeline, parameter_manager,
+                   group_table),
         gloo_context_(gloo_context) {};
-
-  void Initialize() override;
 
   int GetTypeSize(DataType dtype) override;
 
@@ -52,9 +51,14 @@ public:
 
   void Bcast(void* buffer, size_t size, int root_rank, Communicator communicator) override;
 
+  void AlltoallGetRecvSplits(const std::vector<int32_t>& splits,
+                             std::vector<int32_t>& recvsplits) override;
+
   void Barrier(Communicator communicator) override;
 
 protected:
+  void DoInitialization() override;
+
   GlooContext& gloo_context_;
 };
 

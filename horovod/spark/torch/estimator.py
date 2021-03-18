@@ -13,8 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 
-from __future__ import absolute_import
-
 import horovod.spark.common._namedtuple_fix
 
 import copy
@@ -23,32 +21,36 @@ import numbers
 import time
 
 from pyspark import keyword_only
-from pyspark.ml import Model
-from pyspark.ml.param.shared import Param, Params
+from pyspark.ml.param.shared import Param, Params, TypeConverters
 from pyspark.ml.util import MLWritable, MLReadable
+from pyspark.sql import SparkSession
 
-from horovod.run.common.util import codec
+from horovod.runner.common.util import codec
 from horovod.spark.common import util
-from horovod.spark.common.estimator import HorovodEstimator
-from horovod.spark.common.params import EstimatorParams, ModelParams
+from horovod.spark.common.estimator import HorovodEstimator, HorovodModel
+from horovod.spark.common.params import EstimatorParams
 from horovod.spark.common.serialization import \
     HorovodParamsWriter, HorovodParamsReader
 from horovod.spark.torch import remote
 from horovod.spark.torch.util import deserialize_fn, serialize_fn, \
     save_into_bio
 
+import numpy as np
 import torch
 import torch.utils.data
 
 
 def _torch_param_serialize(param_name, param_val):
+    if param_val is None:
+        return None
+
     if param_name in [EstimatorParams.backend.name, EstimatorParams.store.name]:
         # We do not serialize backend and store. These params have to be regenerated for each
         # run of the pipeline
         return None
-
-    if param_val is None:
-        return None
+    elif param_name == EstimatorParams.model.name:
+        serialize = serialize_fn()
+        return serialize(param_val)
 
     return codec.dumps_base64(param_val)
 
@@ -71,6 +73,9 @@ class TorchEstimatorParamsReader(HorovodParamsReader):
         for key, val in dict_values.items():
             if val is None:
                 deserialized_dict[key] = None
+            elif key == EstimatorParams.model.name:
+                deserialize = deserialize_fn()
+                deserialized_dict[key] = deserialize(val)
             else:
                 deserialized_dict[key] = codec.loads_base64(val)
         return deserialized_dict
@@ -85,11 +90,69 @@ class TorchEstimatorParamsReadable(MLReadable):
 
 class TorchEstimator(HorovodEstimator, TorchEstimatorParamsWritable,
                      TorchEstimatorParamsReadable):
+    """Spark Estimator for fitting PyTorch models to a DataFrame.
+
+    Args:
+        num_proc: Number of Horovod processes.  Defaults to `spark.default.parallelism`.
+        model: PyTorch model to train.
+        backend: Optional Backend object for running distributed training function. Defaults to SparkBackend with
+                 `num_proc` worker processes. Cannot be specified if `num_proc` is also provided.
+        store: Store object that abstracts reading and writing of intermediate data and run results.
+        optimizer: PyTorch optimizer to be converted into a `hvd.DistributedOptimizer` for training.
+        loss: PyTorch loss or list of losses.
+        loss_constructors: Optional functions that generate losses.
+        metrics: Optional metrics to record.
+        loss_weights: Optional list of float weight values to assign each loss.
+        sample_weight_col: Optional column indicating the weight of each sample.
+        gradient_compression: Gradient compression used by `hvd.DistributedOptimizer`.
+        feature_cols: Column names used as feature inputs to the model. Must be a list with each feature
+                      mapping to a sequential argument in the model's forward() function.
+        input_shapes: List of shapes for each input tensor to the model.
+        validation: Optional validation column name (string) where every row in the column is either 1/True or 0/False,
+                    or validation split (float) giving percent of data to be randomly selected for validation.
+        label_cols: Column names used as labels.  Must be a list with one label for each output of the model.
+        batch_size: Number of rows from the DataFrame per batch.
+        val_batch_size: Number of rows from the DataFrame per batch for validation, if not set, will use batch_size.
+        epochs: Number of epochs to train.
+        verbose: Verbosity level [0, 2] (default: 1).
+        shuffle_buffer_size: Optional size of in-memory shuffle buffer in rows. Allocating a larger buffer size
+                             increases randomness of shuffling at the cost of more host memory. Defaults to estimating
+                             with an assumption of 4GB of memory per host.
+        partitions_per_process: Number of Parquet partitions to assign per worker process from `num_proc` (default: 10).
+        run_id: Optional unique ID for this run for organization in the Store. Will be automatically assigned if not
+                provided.
+        train_minibatch_fn: Optional custom function to execute within the training loop. Defaults to standard
+                            gradient descent process.
+        train_steps_per_epoch: Number of steps to train each epoch. Useful for testing that model trains successfully.
+                               Defaults to training the entire dataset each epoch.
+        validation_steps_per_epoch: Number of validation steps to perform each epoch.
+        transformation_fn: Optional function that takes a row as its parameter
+                           and returns a modified row that is then fed into the
+                           train or validation step. This transformation is
+                           applied after batching. See Petastorm [TransformSpec](https://github.com/uber/petastorm/blob/master/petastorm/transform.py)
+                           for more details. Note that this fucntion constructs
+                           another function which should perform the
+                           transformation.
+        train_reader_num_workers: This parameter specifies the number of parallel processes that
+                               read the training data from data store and apply data
+                               transformations to it. Increasing this number
+                               will generally increase the reading rate but will also
+                               increase the memory footprint. More processes are
+                               particularly useful if the bandwidth to the data store is not
+                               high enough, or users need to apply transformation such as
+                               decompression or data augmentation on raw data.
+        val_reader_num_workers: Similar to the train_reader_num_workers.
+    """
+
     input_shapes = Param(Params._dummy(), 'input_shapes', 'input layer shapes')
     loss_constructors = Param(Params._dummy(), 'loss_constructors',
                               'functions that construct the loss')
     train_minibatch_fn = Param(Params._dummy(), 'train_minibatch_fn',
                                'functions that construct the minibatch train function for torch')
+
+    inmemory_cache_all = Param(Params._dummy(), 'inmemory_cache_all',
+                               'Cache the data in memory for training and validation.',
+                               typeConverter=TypeConverters.toBoolean)
 
     @keyword_only
     def __init__(self,
@@ -110,6 +173,7 @@ class TorchEstimator(HorovodEstimator, TorchEstimatorParamsWritable,
                  label_cols=None,
                  callbacks=None,
                  batch_size=None,
+                 val_batch_size=None,
                  epochs=None,
                  verbose=1,
                  shuffle_buffer_size=None,
@@ -117,25 +181,24 @@ class TorchEstimator(HorovodEstimator, TorchEstimatorParamsWritable,
                  run_id=None,
                  train_minibatch_fn=None,
                  train_steps_per_epoch=None,
-                 validation_steps_per_epoch=None):
+                 validation_steps_per_epoch=None,
+                 transformation_fn=None,
+                 train_reader_num_workers=None,
+                 val_reader_num_workers=None,
+                 label_shapes=None,
+                 inmemory_cache_all=False):
+
         super(TorchEstimator, self).__init__()
         self._setDefault(loss_constructors=None,
                          input_shapes=None,
-                         train_minibatch_fn=None)
+                         train_minibatch_fn=None,
+                         transformation_fn=None,
+                         inmemory_cache_all=False)
 
         kwargs = self._input_kwargs
 
         if EstimatorParams.loss.name in kwargs and TorchEstimator.loss_constructors.name in kwargs:
             raise ValueError("only one of loss_constructors and loss parameters can be specified.")
-
-        if EstimatorParams.loss.name in kwargs and not \
-                (isinstance(loss, list) or isinstance(loss, tuple)):
-            kwargs[EstimatorParams.loss.name] = [kwargs[EstimatorParams.loss.name]]
-
-        if TorchEstimator.loss_constructors.name in kwargs and not \
-                (isinstance(loss_constructors, list) or isinstance(loss_constructors, tuple)):
-            kwargs[TorchEstimator.loss_constructors.name] = [
-                kwargs[TorchEstimator.loss_constructors.name]]
 
         self.setParams(**kwargs)
 
@@ -157,6 +220,12 @@ class TorchEstimator(HorovodEstimator, TorchEstimatorParamsWritable,
     def getLossConstructors(self):
         return self.getOrDefault(self.loss_constructors)
 
+    def setInMemoryCacheAll(self, value):
+        return self._set(inmemory_cache_all=value)
+
+    def getInMemoryCacheAll(self):
+        return self.getOrDefault(self.inmemory_cache_all)
+
     def _get_optimizer(self):
         return self.getOrDefault(self.optimizer)
 
@@ -177,7 +246,8 @@ class TorchEstimator(HorovodEstimator, TorchEstimatorParamsWritable,
         util.check_shape_compatibility(metadata,
                                        self.getFeatureCols(),
                                        self.getLabelCols(),
-                                       input_shapes=self.getInputShapes())
+                                       input_shapes=self.getInputShapes(),
+                                       label_shapes=self.getLabelShapes())
 
     def _fit_on_prepared_data(self, backend, train_rows, val_rows, metadata, avg_row_size, dataset_idx=None):
         self._check_params(metadata)
@@ -231,6 +301,7 @@ class TorchEstimator(HorovodEstimator, TorchEstimatorParamsWritable,
         optimizer = copy.deepcopy(self.getOptimizer())
 
         model.load_state_dict(best_checkpoint['model'])
+        model.eval()
         optimizer.load_state_dict(best_checkpoint['optimizer'])
 
         return self.get_model_class()(**self._get_model_kwargs(
@@ -252,7 +323,22 @@ class TorchEstimator(HorovodEstimator, TorchEstimatorParamsWritable,
                     loss_constructors=self.getLossConstructors())
 
 
-class TorchModel(Model, ModelParams, TorchEstimatorParamsWritable, TorchEstimatorParamsReadable):
+class TorchModel(HorovodModel, TorchEstimatorParamsWritable, TorchEstimatorParamsReadable):
+    """Spark Transformer wrapping a PyTorch model, used for making predictions on a DataFrame.
+
+    Retrieve the underlying PyTorch model by calling `torch_model.getModel()`.
+
+    Args:
+        history: List of metrics, one entry per epoch during training.
+        model: Trained PyTorch model.
+        feature_columns: List of feature column names.
+        label_columns: List of label column names.
+        optimizer: PyTorch optimizer used during training, containing updated state.
+        run_id: ID of the run used to train the model.
+        loss: PyTorch loss(es).
+        loss_constructors: PyTorch loss constructors.
+    """
+
     optimizer = Param(Params._dummy(), 'optimizer', 'optimizer')
     input_shapes = Param(Params._dummy(), 'input_shapes', 'input layer shapes')
     loss = Param(Params._dummy(), 'loss', 'loss')
@@ -322,9 +408,11 @@ class TorchModel(Model, ModelParams, TorchEstimatorParamsWritable, TorchEstimato
 
     # To run locally on OS X, need export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES
     def _transform(self, df):
-        model_pre_predict = self.getModel()
-        model_pre_predict.eval()
+        import copy
+        from pyspark.sql.types import StructField, StructType
+        from pyspark.ml.linalg import VectorUDT
 
+        model_pre_predict = self.getModel()
         deserialize = deserialize_fn()
         serialize = serialize_fn()
         serialized_model = serialize(model_pre_predict)
@@ -334,6 +422,8 @@ class TorchModel(Model, ModelParams, TorchEstimatorParamsWritable, TorchEstimato
         output_cols = self.getOutputCols()
         feature_cols = self.getFeatureColumns()
         metadata = self._get_metadata()
+
+        final_output_cols = util.get_output_cols(df.schema, output_cols)
 
         def predict(rows):
             from pyspark import Row
@@ -360,7 +450,7 @@ class TorchModel(Model, ModelParams, TorchEstimatorParamsWritable, TorchEstimato
                     col_type = meta['spark_data_type']
                     # dtype for dense and spark tensor is always np.float64
                     if col_type == DenseVector:
-                        shape = meta['shape']
+                        shape = np.prod(pred.shape)
                         flattened_pred = pred.reshape(shape, )
                         field = DenseVector(flattened_pred)
                     elif col_type == SparseVector:
@@ -381,6 +471,33 @@ class TorchModel(Model, ModelParams, TorchEstimatorParamsWritable, TorchEstimato
 
                     fields[output_col] = field
 
-                yield Row(**fields)
+                values = [fields[col] for col in final_output_cols]
 
-        return df.rdd.mapPartitions(predict).toDF()
+                yield Row(*values)
+
+        spark0 = SparkSession._instantiatedSession
+
+        final_output_fields = []
+
+        # copy input schema
+        for field in df.schema.fields:
+            final_output_fields.append(copy.deepcopy(field))
+
+        # append output schema
+        override_fields = df.limit(1).rdd.mapPartitions(predict).toDF().schema.fields[-len(output_cols):]
+        for name, override, label in zip(output_cols, override_fields, label_cols):
+            # default data type as label type
+            data_type = metadata[label]['spark_data_type']()
+
+            if type(override.dataType) == VectorUDT:
+                # Override output to vector. This is mainly for torch's classification loss
+                # where label is a scalar but model output is a vector.
+                data_type = VectorUDT()
+            final_output_fields.append(StructField(name=name, dataType=data_type, nullable=True))
+
+        final_output_schema = StructType(final_output_fields)
+
+        pred_rdd = df.rdd.mapPartitions(predict)
+
+        # Use the schema from previous section to construct the final DF with prediction
+        return spark0.createDataFrame(pred_rdd, schema=final_output_schema)

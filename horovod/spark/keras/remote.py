@@ -13,8 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 
-from __future__ import absolute_import
-
 import contextlib
 import io
 import math
@@ -26,7 +24,9 @@ import tensorflow as tf
 from distutils.version import LooseVersion
 
 from horovod.spark.common import constants
-from horovod.run.common.util import codec
+from horovod.spark.common.store import DBFSLocalStore
+from horovod.spark.common.util import _get_assigned_gpu_or_default
+from horovod.runner.common.util import codec
 
 
 PETASTORM_HDFS_DRIVER = constants.PETASTORM_HDFS_DRIVER
@@ -40,6 +40,7 @@ def RemoteTrainer(estimator, metadata, keras_utils, run_id, dataset_idx):
     feature_columns = estimator.getFeatureCols()
     user_callbacks = estimator.getCallbacks()
     batch_size = estimator.getBatchSize()
+    val_batch_size = estimator.getValBatchSize() if estimator.getValBatchSize() else batch_size
     epochs = estimator.getEpochs()
     train_steps_per_epoch = estimator.getTrainStepsPerEpoch()
     validation_steps_per_epoch = estimator.getValidationStepsPerEpoch()
@@ -48,10 +49,16 @@ def RemoteTrainer(estimator, metadata, keras_utils, run_id, dataset_idx):
     should_validate = estimator.getValidation()
     user_shuffle_buffer_size = estimator.getShufflingBufferSize()
     user_verbose = estimator.getVerbose()
+    checkpoint_callback = estimator.getCheckpointCallback()
+
+    # Data reader parameters
+    train_reader_worker_count = estimator.getTrainReaderNumWorker()
+    val_reader_worker_count = estimator.getValReaderNumWorker()
 
     # Model parameters
     input_shapes, output_shapes = estimator.get_model_shapes()
     output_names = estimator.getModel().output_names
+    label_shapes = estimator.getLabelShapes()
 
     # Keras implementation
     keras_module = keras_utils.keras()
@@ -59,9 +66,16 @@ def RemoteTrainer(estimator, metadata, keras_utils, run_id, dataset_idx):
     get_horovod = keras_utils.horovod_fn()
     get_keras = keras_utils.keras_fn()
     make_dataset = keras_utils.make_dataset_fn(
-        feature_columns, label_columns, sample_weight_col, metadata,
-        input_shapes, output_shapes, output_names, batch_size)
+        feature_columns=feature_columns,
+        label_columns=label_columns,
+        sample_weight_col=sample_weight_col,
+        metadata=metadata,
+        input_shapes=input_shapes,
+        label_shapes=label_shapes if label_shapes else output_shapes,
+        output_names=output_names)
     fit = keras_utils.fit_fn(epochs)
+    transformation_fn = estimator.getTransformationFn()
+    transformation = transformation_fn if transformation_fn else None
 
     # Utility functions
     deserialize_keras_model = _deserialize_keras_model_fn()
@@ -70,6 +84,7 @@ def RemoteTrainer(estimator, metadata, keras_utils, run_id, dataset_idx):
 
     # Storage
     store = estimator.getStore()
+    is_dbfs = isinstance(store, DBFSLocalStore)
     remote_store = store.to_remote(run_id, dataset_idx)
 
     def SyncCallback(root_path, sync_to_store_fn, keras):
@@ -84,8 +99,8 @@ def RemoteTrainer(estimator, metadata, keras_utils, run_id, dataset_idx):
         yield None
 
     def train(serialized_model, train_rows, val_rows, avg_row_size):
-        from petastorm import make_batch_reader
-
+        from petastorm import TransformSpec, make_reader, make_batch_reader
+        import horovod as _horovod
         k = get_keras()
         k.backend.set_floatx(floatx)
 
@@ -105,11 +120,20 @@ def RemoteTrainer(estimator, metadata, keras_utils, run_id, dataset_idx):
                 serialized_model, lambda x: hvd.load_model(x))
 
         # Horovod: adjust learning rate based on number of processes.
-        k.backend.set_value(model.optimizer.lr,
-                            k.backend.get_value(model.optimizer.lr) * hvd.size())
+        scaled_lr = k.backend.get_value(model.optimizer.lr) * hvd.size()
+        k.backend.set_value(model.optimizer.lr, scaled_lr)
 
         # Verbose mode 1 will print a progress bar
         verbose = user_verbose if hvd.rank() == 0 else 0
+
+        transform_spec = None
+        if transformation:
+            transform_spec = TransformSpec(transformation)
+
+        # The inital_lr needs to be set to scaled learning rate in the checkpointing callbacks.
+        for callback in user_callbacks:
+            if isinstance(callback, _horovod._keras.callbacks.LearningRateScheduleCallbackImpl):
+                callback.initial_lr = scaled_lr
 
         with remote_store.get_local_output_dir() as run_output_dir:
             callbacks = [
@@ -132,7 +156,22 @@ def RemoteTrainer(estimator, metadata, keras_utils, run_id, dataset_idx):
                 ckpt_file = os.path.join(run_output_dir, remote_store.checkpoint_filename)
                 logs_dir = os.path.join(run_output_dir, remote_store.logs_subdir)
 
-                callbacks.append(k.callbacks.ModelCheckpoint(ckpt_file))
+                # This callback checkpoints the model that ultimately is wrapped and returned after
+                # Estimator.fit is called.
+                _checkpoint_callback = checkpoint_callback
+                if _checkpoint_callback:
+                    _checkpoint_callback.filepath = ckpt_file
+                else:
+                    if is_dbfs and LooseVersion(tf.__version__) < LooseVersion("2.0.0"):
+                        # Because DBFS local file APIs does not support random write which is
+                        # required by h5 format, save_weights_only=True is needed for switching
+                        # to the TensorFlow SavedModel format.
+                        _checkpoint_callback = k.callbacks.ModelCheckpoint(ckpt_file,
+                                                                           save_weights_only=True)
+                    else:
+                        _checkpoint_callback = k.callbacks.ModelCheckpoint(ckpt_file)
+                callbacks.append(_checkpoint_callback)
+
                 if remote_store.saving_runs:
                     callbacks.append(k.callbacks.TensorBoard(logs_dir))
                     callbacks.append(SyncCallback(run_output_dir, remote_store.sync, k))
@@ -143,10 +182,10 @@ def RemoteTrainer(estimator, metadata, keras_utils, run_id, dataset_idx):
                 steps_per_epoch = train_steps_per_epoch
 
             if validation_steps_per_epoch is None:
-                # math.ceil because if val_rows is smaller than batch_size we still get the at least
-                # one step. float(val_rows) because val_rows/batch_size evaluates to zero before
+                # math.ceil because if val_rows is smaller than val_batch_size we still get the at least
+                # one step. float(val_rows) because val_rows/val_batch_size evaluates to zero before
                 # math.ceil
-                validation_steps = int(math.ceil(float(val_rows) / batch_size / hvd.size())) \
+                validation_steps = int(math.ceil(float(val_rows) / val_batch_size / hvd.size())) \
                     if should_validate else None
             else:
                 validation_steps = validation_steps_per_epoch
@@ -155,27 +194,49 @@ def RemoteTrainer(estimator, metadata, keras_utils, run_id, dataset_idx):
             if sample_weight_col:
                 schema_fields.append(sample_weight_col)
 
-            # Petastorm: read data from the store with the correct shard for this rank
-            # setting num_epochs=None will cause an infinite iterator and enables
-            # ranks to perform training and validation with unequal number of
-            # samples
-            with make_batch_reader(remote_store.train_data_path,
-                                   shuffle_row_groups=True,
-                                   num_epochs=None,
-                                   cur_shard=hvd.rank(),
-                                   shard_count=hvd.size(),
-                                   hdfs_driver=PETASTORM_HDFS_DRIVER,
-                                   schema_fields=schema_fields) as train_reader:
-                with make_batch_reader(remote_store.val_data_path,
-                                       num_epochs=None,
-                                       cur_shard=hvd.rank(),
-                                       shard_count=hvd.size(),
-                                       hdfs_driver=PETASTORM_HDFS_DRIVER,
-                                       schema_fields=schema_fields) \
-                        if should_validate else empty_batch_reader() as val_reader:
+            # In general, make_batch_reader is faster than make_reader for reading the dataset.
+            # However, we found out that make_reader performs data transformations much faster than
+            # make_batch_reader with parallel worker processes. Therefore, the default reader
+            # we choose is make_batch_reader unless there are data transformations.
+            reader_factory_kwargs = dict()
+            if transform_spec:
+                reader_factory = make_reader
+                reader_factory_kwargs['pyarrow_serialize'] = True
+                is_batch_reader = False
+            else:
+                reader_factory = make_batch_reader
+                is_batch_reader = True
 
-                    train_data = make_dataset(train_reader, shuffle_buffer_size, shuffle=True)
-                    val_data = make_dataset(val_reader, shuffle_buffer_size, shuffle=False) \
+            # Petastorm: read data from the store with the correct shard for this rank
+            # setting num_epochs=None will cause an infinite iterator
+            # and enables ranks to perform training and validation with
+            # unequal number of samples
+            with reader_factory(remote_store.train_data_path,
+                                num_epochs=None,
+                                cur_shard=hvd.rank(),
+                                reader_pool_type='process',
+                                workers_count=train_reader_worker_count,
+                                shard_count=hvd.size(),
+                                hdfs_driver=PETASTORM_HDFS_DRIVER,
+                                schema_fields=schema_fields,
+                                transform_spec=transform_spec,
+                                **reader_factory_kwargs) as train_reader:
+                with reader_factory(remote_store.val_data_path,
+                                    num_epochs=None,
+                                    cur_shard=hvd.rank(),
+                                    reader_pool_type='process',
+                                    workers_count=val_reader_worker_count,
+                                    shard_count=hvd.size(),
+                                    hdfs_driver=PETASTORM_HDFS_DRIVER,
+                                    schema_fields=schema_fields,
+                                    transform_spec=transform_spec,
+                                    **reader_factory_kwargs) \
+                    if should_validate else empty_batch_reader() as val_reader:
+
+                    train_data = make_dataset(train_reader, batch_size, shuffle_buffer_size,
+                                              is_batch_reader, shuffle=True)
+                    val_data = make_dataset(val_reader, val_batch_size, shuffle_buffer_size,
+                                            is_batch_reader, shuffle=False) \
                         if val_reader else None
 
                     history = fit(model, train_data, val_data, steps_per_epoch,
@@ -187,8 +248,19 @@ def RemoteTrainer(estimator, metadata, keras_utils, run_id, dataset_idx):
             globals()['_DATASET_FINALIZATION_HACK'] = model
 
             if hvd.rank() == 0:
-                with open(ckpt_file, 'rb') as f:
-                    return history.history, codec.dumps_base64(f.read()), hvd.size()
+                if is_dbfs:
+                    if LooseVersion(tf.__version__) < LooseVersion("2.0.0"):
+                        model.load_weights(ckpt_file)
+                    else:
+                        # needs to be deserialized in the with scope
+                        with k.utils.custom_object_scope(custom_objects):
+                            model = k.models.load_model(ckpt_file)
+                    serialized_model = keras_utils.serialize_model(model)
+                else:
+                    with open(ckpt_file, 'rb') as f:
+                        serialized_model = codec.dumps_base64(f.read())
+
+                return history.history, serialized_model, hvd.size()
     return train
 
 
@@ -231,7 +303,7 @@ def _calculate_shuffle_buffer_size_fn():
         """
         local_size = hvd.local_size()
         local_sizes = hvd.allgather([local_size])
-        max_local_size = max(local_sizes)
+        max_local_size = int(max(local_sizes))
 
         if max_local_size > TOTAL_BUFFER_MEMORY_CAP_GIB:
             shuffle_buffer_size = TOTAL_BUFFER_MEMORY_CAP_GIB * BYTES_PER_GIB / avg_row_size / max_local_size
@@ -255,7 +327,8 @@ def _pin_gpu_tensorflow2_fn():
         for gpu in gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
         if gpus:
-            tf.config.experimental.set_visible_devices(gpus[hvd.local_rank()], 'GPU')
+            tf.config.experimental.set_visible_devices(
+                gpus[_get_assigned_gpu_or_default(default=hvd.local_rank())], 'GPU')
     return fn
 
 
@@ -263,7 +336,8 @@ def _pin_gpu_tensorflow1_fn():
     def fn(hvd, tf, keras):
         config = tf.ConfigProto()
         config.gpu_options.allow_growth = True
-        config.gpu_options.visible_device_list = str(hvd.local_rank())
+        config.gpu_options.visible_device_list = \
+            str(_get_assigned_gpu_or_default(default=hvd.local_rank()))
         keras.backend.set_session(tf.Session(config=config))
     return fn
 

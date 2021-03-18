@@ -1,5 +1,6 @@
 // Copyright 2019 Uber Technologies, Inc. All Rights Reserved.
 // Modifications copyright Microsoft
+// Modifications copyright (C) 2020, NVIDIA CORPORATION. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,6 +27,11 @@
 #include "logging.h"
 #include "operations.h"
 
+#if HAVE_CUDA
+#include "ops/cuda/cuda_kernels.h"
+#endif
+
+
 namespace horovod {
 namespace common {
 
@@ -47,10 +53,18 @@ void Controller::SynchronizeParameters() {
 }
 
 Controller::Controller(ResponseCache& response_cache, TensorQueue& tensor_queue,
-                       Timeline& timeline, ParameterManager& parameter_manager)
+                       Timeline& timeline, ParameterManager& parameter_manager,
+                       GroupTable& group_table)
     : stall_inspector_(response_cache), tensor_queue_(tensor_queue),
       timeline_(timeline), response_cache_(response_cache),
-      parameter_manager_(parameter_manager) {}
+      parameter_manager_(parameter_manager), group_table_(group_table) {}
+
+void Controller::Initialize() {
+  response_cache_.clear();
+
+  // Initialize concrete implementations.
+  DoInitialization();
+}
 
 ResponseList Controller::ComputeResponseList(std::atomic_bool& shut_down,
                                              HorovodGlobalState& state) {
@@ -131,15 +145,16 @@ ResponseList Controller::ComputeResponseList(std::atomic_bool& shut_down,
     // Remove uncommon cached tensors from queue and replace to state
     // queue for next cycle. Skip adding common cached tensors to
     // queue as they are handled separately.
+    std::deque<Request> messages_to_replace;
     size_t num_messages = message_queue_tmp.size();
     for (size_t i = 0; i < num_messages; ++i) {
-      auto message = message_queue_tmp.front();
+      auto& message = message_queue_tmp.front();
       if (response_cache_.cached(message) == ResponseCache::CacheState::HIT) {
         uint32_t cache_bit = response_cache_.peek_cache_bit(message);
         if (cache_coordinator.cache_hits().find(cache_bit) ==
             cache_coordinator.cache_hits().end()) {
           // Try to process again in next cycle.
-          tensor_queue_.PushMessageToQueue(message);
+          messages_to_replace.push_back(std::move(message));
         } else {
           // Remove timing entry for messages being handled this cycle.
           stall_inspector_.RemoveCachedTensor(message.tensor_name());
@@ -151,10 +166,11 @@ ResponseList Controller::ComputeResponseList(std::atomic_bool& shut_down,
       }
       message_queue_tmp.pop_front();
     }
+    tensor_queue_.PushMessagesToQueue(messages_to_replace);
   }
 
   if (!message_queue_tmp.empty()) {
-    LOG(DEBUG, rank_) << "Sent " << message_queue_tmp.size()
+    LOG(TRACE, rank_) << "Sent " << message_queue_tmp.size()
                       << " messages to coordinator.";
   }
 
@@ -179,6 +195,34 @@ ResponseList Controller::ComputeResponseList(std::atomic_bool& shut_down,
     // If all messages in queue have responses in cache, use fast path with
     // no additional coordination.
 
+    // If group fusion is disabled, fuse tensors in groups separately
+    if (state.disable_group_fusion && !group_table_.empty()) {
+      // Note: need group order to be based on position in cache for global consistency
+      std::vector<int> common_ready_groups;
+      std::unordered_set<int> processed;
+      for (auto bit : cache_coordinator.cache_hits()) {
+        const auto& tensor_name = response_cache_.peek_response(bit).tensor_names()[0];
+        int group_id = group_table_.GetGroupIDFromTensorName(tensor_name);
+        if (group_id != NULL_GROUP_ID && processed.find(group_id) == processed.end()) {
+          common_ready_groups.push_back(group_id);
+          processed.insert(group_id);
+        }
+      }
+
+      for (auto id : common_ready_groups) {
+        std::deque<Response> responses;
+        for (const auto &tensor_name : group_table_.GetGroupTensorNames(id)) {
+          auto bit = response_cache_.peek_cache_bit(tensor_name);
+          responses.push_back(response_cache_.get_response(bit));
+          // Erase cache hit to avoid processing a second time.
+          cache_coordinator.erase_hit(bit);
+        }
+
+        FuseResponses(responses, state, response_list);
+      }
+    }
+
+
     std::deque<Response> responses;
     // Convert cache hits to responses. Populate so that least
     // recently used responses get priority. All workers call the code
@@ -189,7 +233,8 @@ ResponseList Controller::ComputeResponseList(std::atomic_bool& shut_down,
     }
 
     // Fuse responses as normal.
-    response_list = FuseResponses(responses);
+    FuseResponses(responses, state, response_list);
+    response_list.set_shutdown(cache_coordinator.should_shut_down());
   } else {
     // There are uncached messages coming in, need communication to figure out
     // whether those are ready to be reduced.
@@ -262,6 +307,56 @@ ResponseList Controller::ComputeResponseList(std::atomic_bool& shut_down,
         }
       }
 
+      // Fuse tensors in groups before processing others.
+      if (state.disable_group_fusion && !group_table_.empty()) {
+
+        // Extract set of common groups from coordinator tensor list and cache hits.
+        std::vector<int> common_ready_groups;
+        std::unordered_set<int> processed;
+
+        for (const auto& tensor_name : ready_to_reduce) {
+          int group_id = group_table_.GetGroupIDFromTensorName(tensor_name);
+          if (group_id != NULL_GROUP_ID && processed.find(group_id) == processed.end()) {
+            common_ready_groups.push_back(group_id);
+            processed.insert(group_id);
+            // Leaving name in list, to be skipped later.
+          }
+        }
+
+        if (response_cache_.capacity() > 0) {
+          for (auto bit : cache_coordinator.cache_hits()) {
+            const auto& tensor_name = response_cache_.peek_response(bit).tensor_names()[0];
+            int group_id = group_table_.GetGroupIDFromTensorName(tensor_name);
+            if (group_id != NULL_GROUP_ID && processed.find(group_id) == processed.end()) {
+              common_ready_groups.push_back(group_id);
+              processed.insert(group_id);
+            }
+          }
+        }
+
+        // For each ready group, form and fuse response lists independently
+        for (auto id : common_ready_groups) {
+          std::deque<Response> responses;
+          for (const auto &tensor_name : group_table_.GetGroupTensorNames(id)) {
+            if (message_table_.find(tensor_name) != message_table_.end()) {
+              // Uncached message
+              Response response = ConstructResponse(tensor_name, state.joined_size);
+              responses.push_back(std::move(response));
+
+            } else {
+              // Cached message
+              auto bit = response_cache_.peek_cache_bit(tensor_name);
+              responses.push_back(response_cache_.get_response(bit));
+              // Erase cache hit to avoid processing a second time.
+              cache_coordinator.erase_hit(bit);
+            }
+          }
+
+          FuseResponses(responses, state, response_list);
+        }
+      }
+
+
       // At this point, rank zero should have a fully updated tensor count
       // table and should know all the tensors that need to be reduced or
       // gathered, and everyone else should have sent all their information
@@ -284,6 +379,13 @@ ResponseList Controller::ComputeResponseList(std::atomic_bool& shut_down,
       }
 
       for (auto& tensor_name : ready_to_reduce) {
+        // Skip tensors in group that were handled earlier.
+        if (state.disable_group_fusion &&
+            !group_table_.empty() &&
+            group_table_.GetGroupIDFromTensorName(tensor_name) != NULL_GROUP_ID) {
+          continue;
+        }
+
         Response response = ConstructResponse(tensor_name, state.joined_size);
         responses.push_back(std::move(response));
       }
@@ -295,7 +397,7 @@ ResponseList Controller::ComputeResponseList(std::atomic_bool& shut_down,
         responses.push_back(std::move(join_response));
         state.joined_size = 0;
       }
-      response_list = FuseResponses(responses);
+      FuseResponses(responses, state, response_list);
       response_list.set_shutdown(should_shut_down);
 
       // Broadcast final results to other ranks.
@@ -332,7 +434,8 @@ ResponseList Controller::ComputeResponseList(std::atomic_bool& shut_down,
     // order consistently across workers.
     for (auto& response : response_list.responses()) {
       if ((response.response_type() == Response::ResponseType::ALLREDUCE ||
-           response.response_type() == Response::ResponseType::ADASUM) &&
+           response.response_type() == Response::ResponseType::ADASUM ||
+           response.response_type() == Response::ResponseType::ALLTOALL) &&
           (int)response.devices().size() == size_) {
         response_cache_.put(response, tensor_queue_, state.joined);
       }
@@ -365,7 +468,7 @@ int64_t Controller::TensorFusionThresholdBytes() {
   return proposed_fusion_threshold;
 }
 
-Response Controller::ConstructResponse(std::string& name, int joined_size) {
+Response Controller::ConstructResponse(const std::string& name, int joined_size) {
   bool error = false;
   auto it = message_table_.find(name);
   assert(it != message_table_.end());
@@ -375,7 +478,7 @@ Response Controller::ConstructResponse(std::string& name, int joined_size) {
 
   std::ostringstream error_message_stream;
 
-  // Check that all data types of tensors being reduced, gathered or broadcasted
+  // Check that all data types of tensors being processed
   // are identical.
   auto data_type = requests[0].tensor_type();
   for (unsigned int i = 1; i < requests.size(); ++i) {
@@ -439,17 +542,52 @@ Response Controller::ConstructResponse(std::string& name, int joined_size) {
     }
   }
 
+  // If we are doing an allreduce, check that prescaling and postscaling factors
+  // are identical across ranks.
+  double prescale_factor;
+  double postscale_factor;
+  if (message_type == Request::ALLREDUCE ||
+      message_type == Request::ADASUM) {
+    prescale_factor = requests[0].prescale_factor();
+    postscale_factor = requests[0].postscale_factor();
+
+    for (unsigned int i = 1; i < requests.size(); ++i) {
+      if (error) {
+        break;
+      }
+      double request_prescale_factor = requests[i].prescale_factor();
+      double request_postscale_factor = requests[i].postscale_factor();
+
+      if (prescale_factor != request_prescale_factor ||
+          postscale_factor != request_postscale_factor) {
+        error = true;
+        error_message_stream
+            << "Mismatched prescale and/or postscale factors: "
+            << "One rank sent factors (" << prescale_factor
+            << ", " << postscale_factor << "), but another rank "
+            << "sent factors (" << request_prescale_factor
+            << ", " << request_postscale_factor << ").";
+        break;
+      }
+    }
+  }
+
   std::vector<int64_t> tensor_sizes;
-  if (message_type == Request::ALLGATHER) {
+  if (message_type == Request::ALLGATHER ||
+      message_type == Request::ALLTOALL) {
     if (joined_size > 0) {
       error = true;
-      error_message_stream << "Allgather is not supported with Join at this time. "
-                           << "Specify sparse_to_dense=True if using DistributedOptimizer";
+      if (message_type == Request::ALLGATHER) {
+        error_message_stream << "Allgather is not supported with Join at this time. "
+                             << "Specify sparse_to_dense=True if using DistributedOptimizer";
+      } else if (message_type == Request::ALLTOALL) {
+        error_message_stream << "Alltoall is not supported with Join at this time.";
+      }
     }
 
-    // If we are doing an allgather, make sure all but the first dimension are
+    // If we are doing an allgather/alltoall, make sure all but the first dimension are
     // the same. The first dimension may be different and the output tensor is
-    // the sum of the first dimension. Collect the sizes by rank.
+    // the sum of the first dimension. Collect the sizes by rank for allgather only.
     tensor_sizes.resize(requests.size());
     TensorShape tensor_shape;
     for (auto dim : requests[0].tensor_shape()) {
@@ -503,7 +641,10 @@ Response Controller::ConstructResponse(std::string& name, int joined_size) {
         break;
       }
 
-      tensor_sizes[requests[i].request_rank()] = request_shape.dim_size(0);
+      // Collect first dimension sizes for allgather to use for fusion and allgather op.
+      if (message_type == Request::ALLGATHER) {
+        tensor_sizes[requests[i].request_rank()] = request_shape.dim_size(0);
+      }
     }
   }
 
@@ -581,14 +722,20 @@ Response Controller::ConstructResponse(std::string& name, int joined_size) {
       response.add_tensor_size(dim);
     }
     response.set_tensor_type(data_type);
+    response.set_prescale_factor(prescale_factor);
+    response.set_postscale_factor(postscale_factor);
   } else if (message_type == Request::BROADCAST) {
     response.set_response_type(Response::BROADCAST);
+  } else if (message_type == Request::ALLTOALL) {
+    response.set_response_type(Response::ALLTOALL);
   } else if (message_type == Request::ADASUM) {
     response.set_response_type(Response::ADASUM);
     for (auto dim : tensor_sizes) {
       response.add_tensor_size(dim);
     }
     response.set_tensor_type(data_type);
+    response.set_prescale_factor(prescale_factor);
+    response.set_postscale_factor(postscale_factor);
   }
   response.set_devices(devices);
 
@@ -627,8 +774,9 @@ void Controller::CoordinateCacheAndState(CacheCoordinator& cache_coordinator) {
   }
 }
 
-ResponseList Controller::FuseResponses(std::deque<Response>& responses) {
-  ResponseList response_list;
+void Controller::FuseResponses(std::deque<Response>& responses,
+                               HorovodGlobalState& state,
+                               ResponseList& response_list) {
   while (!responses.empty()) {
 
     auto response = responses.front();
@@ -640,23 +788,39 @@ ResponseList Controller::FuseResponses(std::deque<Response>& responses) {
       // Attempt to add more responses to this fused response.
 
       tensor_size = response.tensor_sizes()[0] * GetTypeSize(response.tensor_type());
+#if HAVE_CUDA
+      if (state.batch_d2d_memcopies) {
+        // Add 16 byte pad for batched memcpy op
+        tensor_size = BATCHED_D2D_PADDING * ((tensor_size + BATCHED_D2D_PADDING - 1) / BATCHED_D2D_PADDING);
+      }
+#endif
       std::deque<Response> skipped_responses;
       int64_t skipped_size = 0;
       while (!responses.empty()) {
-        auto new_response = responses.front();
+        auto& new_response = responses.front();
         assert(new_response.tensor_names().size() == 1);
 
         int64_t new_tensor_size = new_response.tensor_sizes().empty()
                                       ? 0
                                       : new_response.tensor_sizes()[0] *
                                         GetTypeSize(new_response.tensor_type());
+
+#if HAVE_CUDA
+        if (state.batch_d2d_memcopies) {
+          // Add 16 byte pad for batched memcpy op
+          new_tensor_size = BATCHED_D2D_PADDING * ((new_tensor_size + BATCHED_D2D_PADDING - 1) / BATCHED_D2D_PADDING);
+        }
+#endif
+
         if (response.response_type() == new_response.response_type() &&
             response.devices() == new_response.devices() &&
             response.tensor_type() == new_response.tensor_type() &&
-            tensor_size + new_tensor_size <= TensorFusionThresholdBytes()) {
+            tensor_size + new_tensor_size <= TensorFusionThresholdBytes() &&
+            response.prescale_factor() == new_response.prescale_factor() &&
+            response.postscale_factor() == new_response.postscale_factor()) {
           // These tensors will fuse together well.
           tensor_size += new_tensor_size;
-          response.add_tensor_name(new_response.tensor_names()[0]);
+          response.add_tensor_name(std::move(new_response.tensor_names()[0]));
           response.add_tensor_size(new_response.tensor_sizes()[0]);
           responses.pop_front();
         } else {
@@ -671,7 +835,7 @@ ResponseList Controller::FuseResponses(std::deque<Response>& responses) {
           skipped_size += new_tensor_size;
           if (tensor_size + skipped_size <= TensorFusionThresholdBytes()) {
             // Skip response and look ahead for more to fuse.
-            skipped_responses.push_back(std::move(responses.front()));
+            skipped_responses.push_back(std::move(new_response));
             responses.pop_front();
           } else {
             break;
@@ -697,7 +861,7 @@ ResponseList Controller::FuseResponses(std::deque<Response>& responses) {
       int64_t skipped_size = 0;
       while (!responses.empty()) {
 
-        auto new_response = responses.front();
+        auto& new_response = responses.front();
         assert(new_response.tensor_names().size() == 1);
         const auto& new_entry =
             tensor_queue_.GetTensorEntry(new_response.tensor_names()[0]);
@@ -729,7 +893,7 @@ ResponseList Controller::FuseResponses(std::deque<Response>& responses) {
           if (total_byte_size_of_output + skipped_size <=
               TensorFusionThresholdBytes()) {
             // Skip response and look ahead for more to fuse.
-            skipped_responses.push_back(std::move(responses.front()));
+            skipped_responses.push_back(std::move(new_response));
             responses.pop_front();
           } else {
             break;
@@ -744,10 +908,9 @@ ResponseList Controller::FuseResponses(std::deque<Response>& responses) {
       }
     }
 
-    response_list.add_response(response);
-    LOG(DEBUG) << "Created response of size " << tensor_size;
+    response_list.add_response(std::move(response));
+    LOG(TRACE) << "Created response of size " << tensor_size;
   }
-  return response_list;
 }
 
 int64_t Controller::TotalByteSizeOfAllgatherOutput(
@@ -801,5 +964,40 @@ bool Controller::IncrementTensorCount(const Request& msg, int joined_size) {
   return ready_to_reduce;
 }
 
+void Controller::SetTimelineEnabled(bool value) {
+  std::lock_guard<std::recursive_mutex> guard(timeline_mutex_);
+  timeline_enabled_pending_ = value;
+  timeline_enabled_ = value;
+}
+
+void Controller::SetTimelineEnabledPending(bool value) {
+  std::lock_guard<std::recursive_mutex> guard(timeline_mutex_);
+  timeline_enabled_pending_ = value;
+}
+
+void Controller::SetMarkCyclesInTimelinePending(bool value) {
+  std::lock_guard<std::recursive_mutex> guard(timeline_mutex_);
+  mark_cycles_in_timeline_pending_ = value;
+}
+
+void Controller::SynchronizeTimelineEnabled() {
+  std::lock_guard<std::recursive_mutex> guard(timeline_mutex_);
+  timeline_enabled_ = timeline_enabled_pending_;
+}
+
+bool Controller::TimeLineEnabled() {
+  std::lock_guard<std::recursive_mutex> guard(timeline_mutex_);
+  return timeline_enabled_;
+}
+
+bool Controller::TimelineEnabledPending() {
+  std::lock_guard<std::recursive_mutex> guard(timeline_mutex_);
+  return timeline_enabled_pending_;
+}
+
+bool Controller::MarkCyclesInTimelinePending() {
+  std::lock_guard<std::recursive_mutex> guard(timeline_mutex_);
+  return mark_cycles_in_timeline_pending_;
+}
 } // namespace common
 } // namespace horovod

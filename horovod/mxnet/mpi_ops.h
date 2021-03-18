@@ -1,4 +1,5 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Modifications copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -33,35 +34,68 @@ using namespace horovod::common;
 typedef ::mxnet::NDArray NDArray;
 typedef ::mxnet::Engine::CallbackOnComplete CallbackOnComplete;
 typedef Request::RequestType OperationType;
-typedef std::shared_ptr<MXTensor<NDArray>> MXTensorSharedPtr;
+typedef std::shared_ptr<MXTensor> MXTensorSharedPtr;
+typedef std::shared_ptr<NDArray> NDArraySharedPtr;
 
 struct MpiOpsParam {
-  NDArray* input;
-  NDArray* output;
-  MXTensorSharedPtr cpu_tensor;
+  std::vector<NDArraySharedPtr> input_tensors;
+  std::vector<NDArraySharedPtr> output_tensors;
+  std::vector<NDArray*> outputs;
+  std::vector<NDArraySharedPtr> cpu_input_tensors;
+  std::vector<NDArraySharedPtr> cpu_output_tensors;
   OperationType op_type;
-  std::string op_name;
+  std::vector<std::string> op_names;
   int root_rank;
+  NDArraySharedPtr splits_tensor;
+  NDArraySharedPtr received_splits_tensor;
+  bool average;
+  double prescale_factor;
+  double postscale_factor;
+  int del_count = 0;
 
-  MpiOpsParam(NDArray* input, NDArray* output,
-              MXTensorSharedPtr cpu_tensor,
-              const OperationType& op_type, const std::string& op_name,
-              int root_rank)
-      : input(input),
-        output(output),
-        cpu_tensor(cpu_tensor),
+  MpiOpsParam(std::vector<NDArraySharedPtr>&& input_tensors,
+              std::vector<NDArraySharedPtr>&& output_tensors,
+              std::vector<NDArray*>&& outputs,
+              const std::vector<NDArraySharedPtr>& cpu_input_tensors,
+              const std::vector<NDArraySharedPtr>& cpu_output_tensors,
+              const OperationType& op_type,
+              std::vector<std::string>&& op_names,
+              int root_rank, bool average,
+              NDArraySharedPtr splits_tensor,
+              NDArraySharedPtr received_splits_tensor,
+              double prescale_factor,
+              double postscale_factor)
+      : input_tensors(std::move(input_tensors)),
+        output_tensors(std::move(output_tensors)),
+        outputs(std::move(outputs)),
+        cpu_input_tensors(cpu_input_tensors),
+        cpu_output_tensors(cpu_output_tensors),
         op_type(op_type),
-        op_name(op_name),
-        root_rank(root_rank) {
+        op_names(std::move(op_names)),
+        root_rank(root_rank),
+        splits_tensor(splits_tensor),
+        received_splits_tensor(received_splits_tensor),
+        average(average),
+        prescale_factor(prescale_factor),
+        postscale_factor(postscale_factor) {
   }
 };
 
-inline MpiOpsParam* CreateMpiOpsParam(NDArray* input, NDArray* output,
-                                      MXTensorSharedPtr cpu_tensor,
+inline MpiOpsParam* CreateMpiOpsParam(std::vector<NDArraySharedPtr>&& input_tensors,
+                                      std::vector<NDArraySharedPtr>&& output_tensors,
+                                      std::vector<NDArray*>&& outputs,
+                                      const std::vector<NDArraySharedPtr>& cpu_input_tensors,
+                                      const std::vector<NDArraySharedPtr>& cpu_output_tensors,
                                       const OperationType& op_type,
-                                      const std::string& op_name,
-                                      int root_rank) {
-  return new MpiOpsParam(input, output, cpu_tensor, op_type, op_name, root_rank);
+                                      std::vector<std::string>&& op_names,
+                                      int root_rank, bool average,
+                                      NDArraySharedPtr splits_tensor,
+                                      NDArraySharedPtr received_splits_tensor,
+                                      double prescale_factor,
+                                      double postscale_factor) {
+  return new MpiOpsParam(std::move(input_tensors), std::move(output_tensors), std::move(outputs),
+    cpu_input_tensors, cpu_output_tensors, op_type, std::move(op_names), root_rank, average,
+    splits_tensor, received_splits_tensor, prescale_factor, postscale_factor);
 }
 
 void DeleteMpiOpsParam(void* param) {
@@ -69,14 +103,26 @@ void DeleteMpiOpsParam(void* param) {
   delete ops_param;
 }
 
-extern "C" int horovod_mxnet_allreduce_async(NDArray* input, NDArray* output,
+extern "C" int horovod_mxnet_allreduce_async(NDArray* const * inputs,
+                                             NDArray* const * outputs,
                                              const char* name, bool average,
-                                             int priority);
-extern "C" int horovod_mxnet_allgather_async(NDArray* input, NDArray* output,
+                                             int priority,
+                                             double prescale_factor,
+                                             double postscale_factor,
+                                             int num_tensors);
+extern "C" int horovod_mxnet_allgather_async(NDArray* input,
+                                             NDArray* output,
                                              const char* name, int priority);
-extern "C" int horovod_mxnet_broadcast_async(NDArray* input, NDArray* output,
+extern "C" int horovod_mxnet_broadcast_async(NDArray* input,
+                                             NDArray* output,
                                              const char* name, int root_rank,
                                              int priority);
+extern "C" int horovod_mxnet_alltoall_async(NDArray* input,
+                                            NDArray* output,
+                                            const char* name,
+                                            NDArray* splits,
+                                            NDArray* output_received_splits,
+                                            int priority);
 
 } // namespace mxnet
 } // namespace horovod

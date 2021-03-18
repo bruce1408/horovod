@@ -13,18 +13,20 @@
 # limitations under the License.
 # ==============================================================================
 
-from __future__ import absolute_import
-from __future__ import print_function
-
 import contextlib
 import errno
 import os
 import re
 import shutil
 import tempfile
+import warnings
+
+from distutils.version import LooseVersion
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+from horovod.spark.common.util import is_databricks
 
 
 class Store(object):
@@ -49,45 +51,63 @@ class Store(object):
         self._val_data_to_key = {}
 
     def is_parquet_dataset(self, path):
+        """Returns True if the path is the root of a Parquet dataset."""
         raise NotImplementedError()
 
     def get_parquet_dataset(self, path):
+        """Returns a :py:class:`pyarrow.parquet.ParquetDataset` from the path."""
         raise NotImplementedError()
 
     def get_train_data_path(self, idx=None):
+        """Returns the path to the training dataset."""
         raise NotImplementedError()
 
     def get_val_data_path(self, idx=None):
+        """Returns the path to the validation dataset."""
         raise NotImplementedError()
 
     def get_test_data_path(self, idx=None):
+        """Returns the path to the test dataset."""
         raise NotImplementedError()
 
     def saving_runs(self):
+        """Returns True if run output should be saved during training."""
         raise NotImplementedError()
 
     def get_runs_path(self):
+        """Returns the base path for all runs."""
         raise NotImplementedError()
 
     def get_run_path(self, run_id):
+        """Returns the path to the run with the given ID."""
         raise NotImplementedError()
 
     def get_checkpoint_path(self, run_id):
+        """Returns the path to the checkpoint file for the given run."""
         raise NotImplementedError()
 
     def get_logs_path(self, run_id):
+        """Returns the path to the log directory for the given run."""
         raise NotImplementedError()
 
     def get_checkpoint_filename(self):
+        """Returns the basename of the saved checkpoint file."""
         raise NotImplementedError()
 
     def get_logs_subdir(self):
+        """Returns the subdirectory name for the logs directory."""
         raise NotImplementedError()
 
     def exists(self, path):
+        """Returns True if the path exists in the store."""
         raise NotImplementedError()
 
     def read(self, path):
+        """Returns the contents of the path as bytes."""
+        raise NotImplementedError()
+
+    def write_text(self, path, text):
+        """Write text file to path."""
         raise NotImplementedError()
 
     def get_local_output_dir_fn(self, run_id):
@@ -98,6 +118,7 @@ class Store(object):
         raise NotImplementedError()
 
     def to_remote(self, run_id, dataset_idx):
+        """Returns a view of the store that can execute in a remote environment without Horoovd deps."""
         attrs = self._remote_attrs(run_id, dataset_idx)
 
         class RemoteStore(object):
@@ -127,17 +148,21 @@ class Store(object):
     def create(prefix_path, *args, **kwargs):
         if HDFSStore.matches(prefix_path):
             return HDFSStore(prefix_path, *args, **kwargs)
+        elif is_databricks() and DBFSLocalStore.matches_dbfs(prefix_path):
+            return DBFSLocalStore(prefix_path, *args, **kwargs)
         else:
             return LocalStore(prefix_path, *args, **kwargs)
 
 
 class FilesystemStore(Store):
+    """Abstract class for stores that use a filesystem for underlying storage."""
+
     def __init__(self, prefix_path, train_path=None, val_path=None, test_path=None, runs_path=None, save_runs=True):
         self.prefix_path = self.get_full_path(prefix_path)
-        self._train_path = train_path or self._get_path('intermediate_train_data')
-        self._val_path = val_path or self._get_path('intermediate_val_data')
-        self._test_path = test_path or self._get_path('intermediate_test_data')
-        self._runs_path = runs_path or self._get_path('runs')
+        self._train_path = self._get_full_path_or_default(train_path, 'intermediate_train_data')
+        self._val_path = self._get_full_path_or_default(val_path, 'intermediate_val_data')
+        self._test_path = self._get_full_path_or_default(test_path, 'intermediate_test_data')
+        self._runs_path = self._get_full_path_or_default(runs_path, 'runs')
         self._save_runs = save_runs
         super(FilesystemStore, self).__init__()
 
@@ -147,6 +172,25 @@ class FilesystemStore(Store):
     def read(self, path):
         with self.get_filesystem().open(self.get_localized_path(path), 'rb') as f:
             return f.read()
+
+    def read_serialized_keras_model(self, ckpt_path, model, custom_objects):
+        """Reads the checkpoint file of the keras model into model bytes and returns the base 64
+        encoded model bytes.
+        :param ckpt_path: A string of path to the checkpoint file.
+        :param model: A keras model. This parameter will be used in DBFSLocalStore\
+            .read_serialized_keras_model() when the ckpt_path only contains model weights.
+        :param custom_objects: This parameter will be used in DBFSLocalStore\
+            .read_serialized_keras_model() when loading the keras model.
+        :return: the base 64 encoded model bytes of the checkpoint model.
+        """
+        from horovod.runner.common.util import codec
+
+        model_bytes = self.read(ckpt_path)
+        return codec.dumps_base64(model_bytes)
+
+    def write_text(self, path, text):
+        with self.get_filesystem().open(self.get_localized_path(path), 'w') as f:
+            f.write(text)
 
     def is_parquet_dataset(self, path):
         try:
@@ -166,6 +210,13 @@ class FilesystemStore(Store):
 
     def get_test_data_path(self, idx=None):
         return '{}.{}'.format(self._test_path, idx) if idx is not None else self._test_path
+
+    def get_data_metadata_path(self, path):
+        localized_path = self.get_localized_path(path)
+        if localized_path.endswith('/'):
+            localized_path = localized_path[:-1] # Remove the slash at the end if there is one
+        metadata_cache = localized_path+"_cached_metadata.pkl"
+        return metadata_cache
 
     def saving_runs(self):
         return self._save_runs
@@ -207,6 +258,11 @@ class FilesystemStore(Store):
             return prefix + path
         return get_path
 
+    def _get_full_path_or_default(self, path, default_key):
+        if path is not None:
+            return self.get_full_path(path)
+        return self._get_path(default_key)
+
     def _get_path(self, key):
         return os.path.join(self.prefix_path, key)
 
@@ -226,6 +282,8 @@ class FilesystemStore(Store):
 
 
 class LocalStore(FilesystemStore):
+    """Uses the local filesystem as a store of intermediate data and training artifacts."""
+
     FS_PREFIX = 'file://'
 
     def __init__(self, prefix_path, *args, **kwargs):
@@ -268,9 +326,6 @@ class LocalStore(FilesystemStore):
 
 
 class HDFSStore(FilesystemStore):
-    FS_PREFIX = 'hdfs://'
-    URL_PATTERN = '^(?:(.+://))?(?:([^/:]+))?(?:[:]([0-9]+))?(?:(.+))?$'
-
     """Uses HDFS as a store of intermediate data and training artifacts.
 
     Initialized from a `prefix_path` that can take one of the following forms:
@@ -288,6 +343,10 @@ class HDFSStore(FilesystemStore):
     `port` arguments to this initializer. These parameters will default to `default` and `0` if neither the path URL
     nor the arguments provide this information.
     """
+
+    FS_PREFIX = 'hdfs://'
+    URL_PATTERN = '^(?:(.+://))?(?:([^/:]+))?(?:[:]([0-9]+))?(?:(.+))?$'
+
     def __init__(self, prefix_path,
                  host=None, port=None, user=None, kerb_ticket=None,
                  driver='libhdfs', extra_conf=None, temp_dir=None, *args, **kwargs):
@@ -303,8 +362,9 @@ class HDFSStore(FilesystemStore):
                                  port=port,
                                  user=user,
                                  kerb_ticket=kerb_ticket,
-                                 driver=driver,
                                  extra_conf=extra_conf)
+        if LooseVersion(pa.__version__) < LooseVersion('0.17.0'):
+            self._hdfs_kwargs['driver'] = driver
         self._hdfs = self._get_filesystem_fn()()
 
         super(HDFSStore, self).__init__(prefix_path, *args, **kwargs)
@@ -399,3 +459,55 @@ class HDFSStore(FilesystemStore):
     @classmethod
     def filesystem_prefix(cls):
         return cls.FS_PREFIX
+
+
+class DBFSLocalStore(LocalStore):
+    """Uses Databricks File System (DBFS) local file APIs as a store of intermediate data and
+    training artifacts.
+
+    Initialized from a `prefix_path` starts with `/dbfs/...`, `file:///dbfs/...` or `dbfs:/...`, see
+    https://docs.databricks.com/data/databricks-file-system.html#local-file-apis.
+    """
+    def __init__(self, prefix_path, *args, **kwargs):
+        prefix_path = self.normalize_path(prefix_path)
+        if not prefix_path.startswith("/dbfs/"):
+            warnings.warn("The provided prefix_path might be ephemeral: {} Please provide a "
+                          "`prefix_path` starting with `/dbfs/...`".format(prefix_path))
+        super(DBFSLocalStore, self).__init__(prefix_path, *args, **kwargs)
+
+    @classmethod
+    def matches_dbfs(cls, path):
+        return path.startswith("dbfs:/") or path.startswith("/dbfs/") or path.startswith("file:///dbfs/")
+
+    @staticmethod
+    def normalize_path(path):
+        """
+        Normalize the path to the form `/dbfs/...`
+        """
+        if path.startswith("dbfs:/"):
+            return "/dbfs" + path[5:]
+        if path.startswith("file:///dbfs/"):
+            return path[7:]
+        return path
+
+    def get_checkpoint_filename(self):
+        # Use the default Tensorflow SavedModel format in TF 2.x. In TF 1.x, the SavedModel format
+        # is used by providing `save_weights_only=True` to the ModelCheckpoint() callback.
+        return 'checkpoint.tf'
+
+    def read_serialized_keras_model(self, ckpt_path, model, custom_objects):
+        """
+        Returns serialized keras model.
+        The parameter `model` is for providing the model structure when the checkpoint file only
+        contains model weights.
+        """
+        import tensorflow
+        from tensorflow import keras
+        from horovod.spark.keras.util import TFKerasUtil
+
+        if LooseVersion(tensorflow.__version__) < LooseVersion("2.0.0"):
+            model.load_weights(ckpt_path)
+        else:
+            with keras.utils.custom_object_scope(custom_objects):
+                model = keras.models.load_model(ckpt_path)
+        return TFKerasUtil.serialize_model(model)

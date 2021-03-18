@@ -13,20 +13,19 @@
 # limitations under the License.
 # ==============================================================================
 
-from __future__ import absolute_import
-
 import contextlib
 import io
 import math
 import os
+from datetime import datetime, timezone
 
 import torch
-
 from torch.utils.tensorboard import SummaryWriter
 
 from horovod.spark.common import constants
+from horovod.spark.common.util import _get_assigned_gpu_or_default, to_list
+from horovod.spark.common.store import DBFSLocalStore
 from horovod.spark.torch.util import deserialize_fn
-
 
 PETASTORM_HDFS_DRIVER = constants.PETASTORM_HDFS_DRIVER
 METRIC_PRINT_FREQUENCY = constants.METRIC_PRINT_FREQUENCY
@@ -37,14 +36,15 @@ CUSTOM_SPARSE = constants.CUSTOM_SPARSE
 
 def RemoteTrainer(estimator, metadata, last_checkpoint_state, run_id, dataset_idx):
     # Estimator parameters
-    loss_fns_pre_train = estimator.getLoss()
-    loss_constructors = estimator.getLossConstructors()
     gradient_compression = estimator.getGradientCompression()
     input_shapes = estimator.getInputShapes()
+    label_shapes = estimator.getLabelShapes()
     feature_columns = estimator.getFeatureCols()
     label_columns = estimator.getLabelCols()
+    num_labels = len(label_columns)
     should_validate = estimator.getValidation()
     batch_size = estimator.getBatchSize()
+    val_batch_size = estimator.getValBatchSize() if estimator.getValBatchSize() else batch_size
     epochs = estimator.getEpochs()
     train_steps_per_epoch = estimator.getTrainStepsPerEpoch()
     validation_steps_per_epoch = estimator.getValidationStepsPerEpoch()
@@ -54,13 +54,25 @@ def RemoteTrainer(estimator, metadata, last_checkpoint_state, run_id, dataset_id
     user_verbose = estimator.getVerbose()
     train_minibatch_fn = estimator.getTrainMinibatchFn()
     train_minibatch = train_minibatch_fn if train_minibatch_fn else _train_minibatch_fn()
+    loss_fns_pre_train = to_list(estimator.getLoss(), num_labels)
+    loss_constructors = to_list(estimator.getLossConstructors(), num_labels)
+    transformation_fn = estimator.getTransformationFn()
+    transformation = transformation_fn if transformation_fn else None
+    inmemory_cache_all = estimator.getInMemoryCacheAll()
 
     # If loss weight is not provided, use equal loss for all the labels
-    label_columns = estimator.getLabelCols()
     loss_weights = estimator.getLossWeights()
     if not loss_weights:
-        num_labels = len(label_columns)
         loss_weights = [float(1) / num_labels for _ in range(num_labels)]
+    else:
+        if not isinstance(loss_weights, list) or \
+                len(loss_weights) != len(label_columns):
+            raise ValueError('loss_weights needs to be a list with the same '
+                             'length as the label_columns.')
+
+    # Data reader parameters
+    train_reader_worker_count = estimator.getTrainReaderNumWorker()
+    val_reader_worker_count = estimator.getValReaderNumWorker()
 
     # Utility functions
     deserialize = deserialize_fn()
@@ -77,6 +89,7 @@ def RemoteTrainer(estimator, metadata, last_checkpoint_state, run_id, dataset_id
     # Storage
     store = estimator.getStore()
     remote_store = store.to_remote(run_id, dataset_idx)
+    is_dbfs = isinstance(store, DBFSLocalStore)
 
     @contextlib.contextmanager
     def empty_batch_reader():
@@ -84,8 +97,8 @@ def RemoteTrainer(estimator, metadata, last_checkpoint_state, run_id, dataset_id
 
     def train(serialized_model, optimizer_cls, model_opt_state_serialized,
               train_rows, val_rows, avg_row_size):
-        from petastorm import make_batch_reader
-        from petastorm.pytorch import DataLoader
+        from petastorm import TransformSpec, make_reader, make_batch_reader
+        from petastorm.pytorch import BatchedDataLoader
         import torch
         import horovod.torch as hvd
 
@@ -110,8 +123,8 @@ def RemoteTrainer(estimator, metadata, last_checkpoint_state, run_id, dataset_id
 
         cuda_available = torch.cuda.is_available()
         if cuda_available:
-            # Horovod: pin GPU to local rank.
-            torch.cuda.set_device(hvd.local_rank())
+            # Horovod: pin GPU to local rank or the assigned GPU from spark.
+            torch.cuda.set_device(_get_assigned_gpu_or_default(default=hvd.local_rank()))
             # Move model to GPU.
             model.cuda()
 
@@ -160,12 +173,16 @@ def RemoteTrainer(estimator, metadata, last_checkpoint_state, run_id, dataset_id
         # different number of workers and we need the raw learning rate to adjust with the
         # new number of workers.
 
+        transform_spec = None
+        if transformation:
+            transform_spec = TransformSpec(transformation)
+
         schema_fields = feature_columns + label_columns
         if sample_weight_col:
             schema_fields.append(sample_weight_col)
 
         if train_steps_per_epoch is None:
-            steps_per_epoch = int(math.ceil(float(train_rows) / batch_size / hvd.size()))
+            steps_per_epoch = int(math.floor(float(train_rows) / batch_size / hvd.size()))
         else:
             steps_per_epoch = train_steps_per_epoch
 
@@ -186,27 +203,50 @@ def RemoteTrainer(estimator, metadata, last_checkpoint_state, run_id, dataset_id
                 if cuda_available:
                     model.cuda()
 
+
+            # In general, make_batch_reader is faster than make_reader for reading the dataset.
+            # However, we found out that make_reader performs data transformations much faster than
+            # make_batch_reader with parallel worker processes. Therefore, the default reader
+            # we choose is make_batch_reader unless there are data transformations.
+            reader_factory = None
+            reader_factory_kwargs = dict()
+            if transform_spec:
+                reader_factory = make_reader
+                reader_factory_kwargs['pyarrow_serialize'] = True
+            else:
+                reader_factory = make_batch_reader
+
             # Petastorm: read data from the store with the correct shard for this rank
             # setting num_epochs=None will cause an infinite iterator
             # and enables ranks to perform training and validation with
             # unequal number of samples
-            with make_batch_reader(remote_store.train_data_path,
-                                   num_epochs=None,
-                                   cur_shard=hvd.rank(),
-                                   shard_count=hvd.size(),
-                                   hdfs_driver=PETASTORM_HDFS_DRIVER,
-                                   schema_fields=schema_fields) as train_reader:
-                with make_batch_reader(remote_store.val_data_path,
-                                       num_epochs=None,
-                                       cur_shard=hvd.rank(),
-                                       shard_count=hvd.size(),
-                                       hdfs_driver=PETASTORM_HDFS_DRIVER,
-                                       schema_fields=schema_fields) \
-                        if should_validate else empty_batch_reader() as val_reader:
+            with reader_factory(remote_store.train_data_path,
+                                num_epochs=1 if inmemory_cache_all else None,
+                                cur_shard=hvd.rank(),
+                                reader_pool_type='process',
+                                workers_count=train_reader_worker_count,
+                                shard_count=hvd.size(),
+                                hdfs_driver=PETASTORM_HDFS_DRIVER,
+                                schema_fields=schema_fields,
+                                transform_spec=transform_spec,
+                                **reader_factory_kwargs) as train_reader:
+                with reader_factory(remote_store.val_data_path,
+                                    num_epochs=1 if inmemory_cache_all else None,
+                                    cur_shard=hvd.rank(),
+                                    reader_pool_type='process',
+                                    workers_count=val_reader_worker_count,
+                                    shard_count=hvd.size(),
+                                    hdfs_driver=PETASTORM_HDFS_DRIVER,
+                                    schema_fields=schema_fields,
+                                    transform_spec=transform_spec,
+                                    **reader_factory_kwargs) \
+                    if should_validate else empty_batch_reader() as val_reader:
 
-                    train_loader = DataLoader(train_reader,
-                                              batch_size=batch_size,
-                                              shuffling_queue_capacity=shuffle_buffer_size)
+                    train_loader = BatchedDataLoader(train_reader,
+                                                     num_epochs=epochs if inmemory_cache_all else None,
+                                                     batch_size=batch_size,
+                                                     shuffling_queue_capacity=shuffle_buffer_size,
+                                                     inmemory_cache_all=inmemory_cache_all)
                     train_loader_iter = iter(train_loader)
 
                     def prepare_batch(row):
@@ -220,20 +260,31 @@ def RemoteTrainer(estimator, metadata, last_checkpoint_state, run_id, dataset_id
                             for col in label_columns]
 
                         sample_weights = row.get(sample_weight_col, None)
+                        if sample_weights is not None:
+                            sample_weights = sample_weights.float()
                         if cuda_available:
                             inputs = [input.cuda() for input in inputs]
                             labels = [label.cuda() for label in labels]
+                            if sample_weights is not None:
+                                sample_weights = sample_weights.cuda()
                         return inputs, labels, sample_weights
 
                     def transform_outputs(outputs, labels):
-                        if type(outputs) != tuple and type(outputs) != list:
+                        if not isinstance(outputs, tuple) and not isinstance(outputs,  list):
                             outputs = [outputs]
 
                         # reshape labels to match the output shape of the model
                         if hasattr(outputs[0], 'shape'):
-                            labels = [label.reshape(output.shape)
-                                      if output.shape.numel() == label.shape.numel() else label
-                                      for label, output in zip(labels, outputs)]
+                            if label_shapes:
+                                labels = [label.reshape(label_shape)
+                                          for label, label_shape in zip(labels, label_shapes)]
+                            else:
+                                # If label_shapes parameter is not provided, reshape the label
+                                # columns data to match the shape of the model output
+                                labels = [label.reshape(output.shape) if
+                                          output.shape.numel() == label.shape.numel() else label
+                                          for label, output in zip(labels, outputs)]
+
                         return outputs, labels
 
                     def aggregate_metrics(stage, epoch, loss, metric_value_groups):
@@ -278,10 +329,14 @@ def RemoteTrainer(estimator, metadata, last_checkpoint_state, run_id, dataset_id
                         return aggregate_metrics('train', epoch, train_loss, metric_value_groups)
 
                     if should_validate:
-                        val_loader = DataLoader(val_reader, batch_size=batch_size)
+                        val_loader = BatchedDataLoader(val_reader,
+                                                       num_epochs=epochs if inmemory_cache_all else None,
+                                                       batch_size=batch_size,
+                                                       inmemory_cache_all=inmemory_cache_all)
                         val_loader_iter = iter(val_loader)
+
                         if validation_steps_per_epoch is None:
-                            validation_steps = int(math.ceil(float(val_rows) / batch_size / hvd.size()))
+                            validation_steps = int(math.ceil(float(val_rows) / val_batch_size / hvd.size()))
                         else:
                             validation_steps = validation_steps_per_epoch
 
@@ -318,7 +373,9 @@ def RemoteTrainer(estimator, metadata, last_checkpoint_state, run_id, dataset_id
                             epoch_metrics['validation'] = _validate(epoch)
 
                         if user_verbose > 0:
-                            print(epoch_metrics)
+                            pdt_dt = datetime.now(timezone.utc)
+                            pdt_time_str = pdt_dt.strftime("%Y-%b-%d %H:%M:%S UTC")
+                            print(pdt_time_str, epoch_metrics)
 
                         history.append(epoch_metrics)
                         if hvd.rank() == 0:
@@ -517,12 +574,6 @@ def _write_metrics_summary_fn():
 
 def _calculate_loss_fn():
     def calculate_loss(outputs, labels, loss_weights, loss_fns, sample_weights=None):
-        # If only one loss function is passed by user, use it to calculate the loss on all
-        # the outputs
-        if len(loss_fns) == 1:
-            _loss_fns = [loss_fns[0] for _ in range(len(outputs))]
-        else:
-            _loss_fns = loss_fns
         if sample_weights is not None:
             # when reduction='none', loss function returns the value of all the losses
             # from all the samples. We multiply each sample's weight to its loss and
@@ -534,7 +585,7 @@ def _calculate_loss_fn():
             # the calculated gradients.
             losses = []
             for output, label, loss_fn, loss_weight in zip(outputs, labels,
-                                                           _loss_fns, loss_weights):
+                                                           loss_fns, loss_weights):
                 weight_adjusted_sample_losses = \
                     loss_fn(output, label, reduction='none').flatten() * sample_weights
                 output_loss = weight_adjusted_sample_losses.mean()
@@ -542,7 +593,7 @@ def _calculate_loss_fn():
         else:
             losses = [loss_fn(output, label) * loss_weight for
                       output, label, loss_fn, loss_weight in
-                      zip(outputs, labels, _loss_fns, loss_weights)]
+                      zip(outputs, labels, loss_fns, loss_weights)]
 
         loss = sum(losses)
         return loss

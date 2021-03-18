@@ -68,6 +68,35 @@ class HorovodBasics(object):
         """A function that shuts Horovod down."""
         self.MPI_LIB_CTYPES.horovod_shutdown()
 
+    def is_initialized(self):
+        """Returns True if Horovod is initialized"""
+        return self.MPI_LIB_CTYPES.horovod_is_initialized()
+
+    def start_timeline(self, file_path, mark_cycles=False):
+        """Creates a timeline file at `file_path` and begins recording.
+
+        Args:
+            file_path: String path to the timeline file.
+            mark_cycles: Boolean indicating that cycles should be marked on
+                         the timeline (default: False).
+
+        Raises a `ValueError` if Horovod is not initialized.
+        """
+        result = self.MPI_LIB_CTYPES.horovod_start_timeline(
+            ctypes.c_char_p(file_path.encode('utf-8')),
+            ctypes.c_bool(mark_cycles))
+        if not result:
+            raise ValueError('Horovod has not been initialized; use hvd.init().')
+
+    def stop_timeline(self):
+        """Stops the active timeline recording and closes the file.
+
+        Raises a `ValueError` if Horovod is not initialized.
+        """
+        result = self.MPI_LIB_CTYPES.horovod_stop_timeline()
+        if not result:
+            raise ValueError('Horovod has not been initialized; use hvd.init().')
+
     def size(self):
         """A function that returns the number of Horovod processes.
 
@@ -92,6 +121,21 @@ class HorovodBasics(object):
             raise ValueError(
                 'Horovod has not been initialized; use hvd.init().')
         return local_size
+
+    def cross_size(self):
+        """A function that returns the number of nodes for the local rank of the current
+        Horovod process. For example, if there are 2 nodes in the job: one running 2 processes
+        and the other running 1 process, then the first process on each node will have cross
+        size 2, and the second process on the first node will have cross size 1.
+
+        Returns:
+          An integer scalar containing the number of cross Horovod processes.
+        """
+        cross_size = self.MPI_LIB_CTYPES.horovod_cross_size()
+        if cross_size == -1:
+            raise ValueError(
+                'Horovod has not been initialized; use hvd.init().')
+        return cross_size
 
     def rank(self):
         """A function that returns the Horovod rank of the calling process.
@@ -118,6 +162,21 @@ class HorovodBasics(object):
             raise ValueError(
                 'Horovod has not been initialized; use hvd.init().')
         return local_rank
+
+    def cross_rank(self):
+        """A function that returns the cross Horovod rank of the calling process, across the
+        nodes in the job. The cross rank of a process corresponds to the rank of the node its
+        is running on. For example, if there are 7 nodes in a job, the cross ranks will be
+        zero through six, inclusive.
+
+        Returns:
+          An integer scalar with the cross Horovod rank of the calling process.
+        """
+        cross_rank = self.MPI_LIB_CTYPES.horovod_cross_rank()
+        if cross_rank == -1:
+            raise ValueError(
+                'Horovod has not been initialized; use hvd.init().')
+        return cross_rank
 
     def is_homogeneous(self):
         """Returns True if the cluster is homogeneous.
@@ -187,12 +246,14 @@ class HorovodBasics(object):
         return bool(self.MPI_LIB_CTYPES.horovod_gloo_built())
 
     def nccl_built(self):
-        """Returns True if Horovod was compiled with NCCL support.
+        """Function to check if Horovod was compiled with NCCL support.
 
         Returns:
-          A boolean value indicating whether NCCL support was compiled.
+          An integer value indicating whether NCCL support was compiled.
+          If NCCL support was compiled, returns NCCL_VERSION_CODE. Otherwise,
+          returns 0.
         """
-        return bool(self.MPI_LIB_CTYPES.horovod_nccl_built())
+        return int(self.MPI_LIB_CTYPES.horovod_nccl_built())
 
     def ddl_built(self):
         """Returns True if Horovod was compiled with DDL support.
@@ -209,3 +270,19 @@ class HorovodBasics(object):
           A boolean value indicating whether oneCCL support was compiled.
         """
         return bool(self.MPI_LIB_CTYPES.horovod_ccl_built())
+
+    def cuda_built(self):
+        """Returns True if Horovod was compiled with CUDA support.
+
+        Returns:
+          A boolean value indicating whether CUDA support was compiled.
+        """
+        return bool(self.MPI_LIB_CTYPES.horovod_cuda_built())
+
+    def rocm_built(self):
+        """Returns True if Horovod was compiled with ROCm support.
+
+        Returns:
+          A boolean value indicating whether ROCm support was compiled.
+        """
+        return bool(self.MPI_LIB_CTYPES.horovod_rocm_built())
